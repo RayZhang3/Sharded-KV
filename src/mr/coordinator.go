@@ -1,19 +1,50 @@
 package mr
 
-import "log"
-import "net"
-import "os"
-import "net/rpc"
-import "net/http"
-
+import (
+	"fmt"
+	"log"
+	"net"
+	"net/http"
+	"net/rpc"
+	"os"
+	"time"
+)
 
 type Coordinator struct {
 	// Your definitions here.
-
+	nReduce int
 }
 
 // Your code here -- RPC handlers for the worker to call.
+func (c *Coordinator) Handlers(args *Taskinfo, reply *Taskinfo) error {
+	/*
+		t := args
+		switch t.RPCtype {
+			case REQUEST:
+		}
+		switch
+	*/
+	var flag bool
+	flag = false
+	fmt.Printf("master receive request %v\n", args.RPCtype)
+	if !flag {
+		time.Sleep(1e9)
+		/*
+			reply.RPCtype = MAP
+			reply.NReduce = c.nReduce
+		*/
 
+		reply.RPCtype = REDUCE
+		reply.NMap = 10
+		flag = true
+	} else {
+		reply.RPCtype = REDUCE
+		reply.NMap = 10
+	}
+	return nil
+}
+
+/*
 //
 // an example RPC handler.
 //
@@ -23,8 +54,7 @@ func (c *Coordinator) Example(args *ExampleArgs, reply *ExampleReply) error {
 	reply.Y = args.X + 1
 	return nil
 }
-
-
+*/
 //
 // start a thread that listens for RPCs from worker.go
 //
@@ -49,7 +79,7 @@ func (c *Coordinator) Done() bool {
 	ret := false
 
 	// Your code here.
-
+	//ret = true
 
 	return ret
 }
@@ -60,10 +90,9 @@ func (c *Coordinator) Done() bool {
 // nReduce is the number of reduce tasks to use.
 //
 func MakeCoordinator(files []string, nReduce int) *Coordinator {
-	c := Coordinator{}
+	c := Coordinator{nReduce: nReduce}
 
 	// Your code here.
-
 
 	c.server()
 	return &c
