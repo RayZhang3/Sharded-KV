@@ -6,14 +6,16 @@ package main
 // go run mrsequential.go wc.so pg*.txt
 //
 
-import "fmt"
+import (
+	"fmt"
+	"io/ioutil"
+	"log"
+	"os"
+	"plugin"
+	"sort"
 
-import "6.824/mr"
-import "plugin"
-import "os"
-import "log"
-import "io/ioutil"
-import "sort"
+	"6.824/mr"
+)
 
 // for sorting by key.
 type ByKey []mr.KeyValue
@@ -48,6 +50,8 @@ func main() {
 		}
 		file.Close()
 		kva := mapf(filename, string(content))
+		// map function is called once for each file of input,
+		// The return value is a slice of key/value pairs.
 		intermediate = append(intermediate, kva...)
 	}
 
