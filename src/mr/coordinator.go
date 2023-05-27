@@ -52,6 +52,7 @@ func (c *Coordinator) assignTask(reply *Taskinfo) {
 	var task *Task
 	var found bool
 	if c.Stage == STAGE_MAPPING {
+		timeOutTask(c.MapTask)
 		task, found = findIdleTask(c.MapTask)
 		complete := finduncompletedTask(c.MapTask)
 		//fmt.Println("Task is %v\n\n", complete)
@@ -61,6 +62,7 @@ func (c *Coordinator) assignTask(reply *Taskinfo) {
 			return
 		}
 	} else if c.Stage == STAGE_REDUCING {
+		timeOutTask(c.ReduceTask)
 		task, found = findIdleTask(c.ReduceTask)
 		complete := finduncompletedTask(c.ReduceTask)
 		if complete {
@@ -114,6 +116,16 @@ func finduncompletedTask(tasks []Task) bool {
 		}
 	}
 	return true
+}
+
+func timeOutTask(tasks []Task) {
+	var task *Task
+	for idx, t := range tasks {
+		if t.Status == TASK_WORKING && time.Now().Sub(t.StartTime) > 10e9 {
+			task = &tasks[idx]
+			task.Status = TASK_IDLE
+		}
+	}
 }
 
 //
