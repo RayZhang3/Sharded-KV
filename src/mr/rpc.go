@@ -9,6 +9,7 @@ package mr
 import (
 	"os"
 	"strconv"
+	"time"
 )
 
 //
@@ -25,20 +26,23 @@ type ExampleReply struct {
 }
 
 const (
-	MAP      = 0
-	REDUCE   = 1
-	REQUEST  = 2
-	WORKDONE = 3
+	RPC_MAP      = 0
+	RPC_REDUCE   = 1
+	RPC_REQUEST  = 2
+	RPC_WORKDONE = 3
+	RPC_FAIL     = 4
+	RPC_ALLDONE  = 5
 )
 
 // Add your RPC definitions here.
 
 type Taskinfo struct {
-	RPCtype  int
-	TaskId   int
-	Filename string
-	NMap     int
-	NReduce  int
+	RPCtype   int
+	TaskId    int
+	Filename  string
+	NMap      int
+	NReduce   int
+	StartTime time.Time
 }
 
 // Cook up a unique-ish UNIX-domain socket name
