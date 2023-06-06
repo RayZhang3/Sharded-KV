@@ -232,15 +232,27 @@ func (aea AppendEntriesArgs) String() string {
 //
 // AppendEntries RPC reply structure
 //
+
 type AppendEntriesReply struct {
 	Term             int  // currentTerm, for leader to update itself
 	Success          bool // true if follower contained entry matching prevLogIndex and prevLogTerm
 	LogInconsistency bool // true if Log mismatch, nextIndex--
+	/*
+		Follower
+			1. (Safety) If PrevLogIndex < commitIndex, set XTerm to Log[commitIndex].Term, XIndex to commitIndex + 1
+			2. (Log Unconsistency) If PrevLogIndex > len(rf.Log), set XTerm to -1, XIndex to len(rf.Log)
+			3. (Log Unconsistency) Else, set XTerm to Log[PrevLogIndex].Term, XIndex to rf.getSameTermFirst(args.PrevLogIndex)
 
+		Leader
+			1.If xTerm is -1, follower's Log is shorter than leader's Log, set nextIndex = XLen
+			2.Leader should first search its log for conflictTerm.
+			3.If it finds an entry in its log with that term, set nextIndex to getSameTermLast() + 1 (the one beyond the index of the last entry in that term in its log)
+			4.If it does not find, set nextIndex = XIndex.
+	*/
 	// Lab 2B Fast Backup
-	XTerm  int // term of conflicting term
-	XIndex int // first index of conflicting term
-	XLen   int // length of log (Empty)
+	XTerm  int // Term of conflicting Log, Log[PrevLogIndex].Term or -1
+	XIndex int // Index of first log in conflicting term, valid when XTerm != -1
+	XLen   int // Length of log
 }
 
 func (aer AppendEntriesReply) String() string {
@@ -412,6 +424,24 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// End
 }
 
+func (rf *Raft) debugAppendEntries(args *AppendEntriesArgs) {
+	infoString := fmt.Sprintf("Term %d, LeaderId:%d, PrevLogIndex:%d, PrevLogTerm:%d, LeaderCommit:%d, Entries %s",
+		args.Term, args.LeaderId, args.PrevLogIndex, args.PrevLogTerm, args.LeaderCommit, getLogString(args.Entries))
+	PrettyDebug(dVote, "S%d receive AppendEntries from S%d: %s", rf.me, args.LeaderId, infoString)
+}
+
+func (rf *Raft) debugHeartBeat(args *AppendEntriesArgs) {
+	heartBeatString := fmt.Sprintf("commitIndex %d, LastApplied %d, LogLength %d, Follower's Log %s",
+		rf.commitIndex, rf.lastApplied, len(rf.Log), getLogString(rf.Log))
+	PrettyDebug(dVote, "S%d receive heartBeat from S%d, info: %s", rf.me, args.LeaderId, heartBeatString)
+}
+
+func (rf *Raft) debugConflictsLog(args *AppendEntriesArgs) {
+	conflitsString := fmt.Sprintf("PrevLogIndex %d, PrevLogTerm %d, Log %s, Entries %s",
+		args.PrevLogIndex, args.PrevLogTerm, getLogString(rf.Log), getLogString(args.Entries))
+	PrettyDebug(dLog2, "S%d conflists info: %s", rf.me, conflitsString)
+}
+
 // Lab 2A
 // To implement heartbeats, define an AppendEntries RPC struct
 // (though you may not need all the arguments yet), and have the leader send them out periodically.
@@ -422,10 +452,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	infoString := fmt.Sprintf("Term %d, LeaderId:%d, PrevLogIndex:%d, PrevLogTerm:%d, LeaderCommit:%d, Entries %s",
-		args.Term, args.LeaderId, args.PrevLogIndex, args.PrevLogTerm, args.LeaderCommit, getLogString(args.Entries))
-
-	PrettyDebug(dVote, "S%d receive AppendEntries from S%d: %s", rf.me, args.LeaderId, infoString)
+	rf.debugAppendEntries(args)
 
 	// If RPC request or response contains term T > currentTerm: set currentTerm = T, convert to follower
 	if args.Term > rf.currentTerm {
@@ -446,16 +473,21 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	// Receive HeartBeat, Entries == nil
 	if args.Entries == nil || len(args.Entries) == 0 {
-		heartBeatString := fmt.Sprintf("commitIndex %d, LastApplied %d, LogLength %d, Follower's Log %s",
-			rf.commitIndex, rf.lastApplied, len(rf.Log), getLogString(rf.Log))
-		PrettyDebug(dVote, "S%d receive heartBeat from S%d, info: %s", rf.me, args.LeaderId, heartBeatString)
+		rf.debugHeartBeat(args)
 	}
+
+	// we can't modify committed Log, this condition happens When
+	// 1. Follower receive AppendEntries RPC from Old Leader (partitioned Leader or poor network)
+	// 2. Leader tries to send AppendEntries, decrement nextIndex and resend the AppendEntries request
+	//    because of poor network, the nextIndex is finally less than the commitIndex of the follower.
+	// So, we need to set the conflits Log Entry after committed Log Entries.
 
 	if args.PrevLogIndex < rf.commitIndex {
 		reply.XTerm = rf.Log[rf.commitIndex].Term
 		reply.XIndex = rf.commitIndex + 1
 		return
 	}
+
 	// Log misamtch
 	// Reply false if log doesn’t contain an entry at prevLogIndex whose term matches prevLogTerm
 	contains, prevEntry := rf.getLogAt(args.PrevLogIndex)
@@ -482,9 +514,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	for i, j := 0, args.PrevLogIndex+1; i < len(args.Entries) && j < len(rf.Log); i, j = i+1, j+1 {
 		if args.Entries[i].Term != rf.Log[j].Term {
-			conflitsString := fmt.Sprintf("PrevLogIndex %d, PrevLogTerm %d, Log %s, Entries %s",
-				args.PrevLogIndex, args.PrevLogTerm, getLogString(rf.Log), getLogString(args.Entries))
-			PrettyDebug(dLog2, "S%d conflists info: %s", rf.me, conflitsString)
+			rf.debugConflictsLog(args)
 			rf.Log = rf.Log[:j]
 			PrettyDebug(dLog2, "S%d Log after conflits: %s", rf.me, getLogString(rf.Log))
 			break
@@ -579,12 +609,10 @@ func (rf *Raft) leaderAppendEntries() {
 			// Set args
 			rf.mu.Lock()
 			args := &AppendEntriesArgs{
-				Term:     rf.currentTerm,
-				LeaderId: rf.me,
-				//PrevLogIndex: rf.nextIndex[index] - 1,
-				//PrevLogTerm:  rf.Log[rf.nextIndex[index]-1].Term,
-				PrevLogIndex: 0,
-				PrevLogTerm:  0,
+				Term:         rf.currentTerm,
+				LeaderId:     rf.me,
+				PrevLogIndex: rf.nextIndex[index] - 1,
+				PrevLogTerm:  rf.Log[rf.nextIndex[index]-1].Term,
 				Entries:      nil,
 				LeaderCommit: rf.commitIndex,
 			}
@@ -592,10 +620,6 @@ func (rf *Raft) leaderAppendEntries() {
 			// args.PrevLogTerm = rf.Log[args.PrevLogIndex].Term
 			// If last log index ≥ nextIndex for a follower:
 			// send AppendEntries RPC with log entries starting at nextIndex
-			if rf.nextIndex[index] > 1 {
-				args.PrevLogIndex = rf.nextIndex[index] - 1
-				args.PrevLogTerm = rf.Log[args.PrevLogIndex].Term
-			}
 
 			if rf.getLastLogIndex() >= rf.nextIndex[index] {
 				entries := rf.Log[rf.nextIndex[index]:]
@@ -639,28 +663,30 @@ func (rf *Raft) leaderAppendEntries() {
 					if reply.XTerm == -1 {
 						rf.nextIndex[index] = reply.XLen
 					} else {
+						// set nextIndex according to the reply
+						rf.handleLogInconsistency(index, reply)
+						/*
+							// the leader should first search its log for conflictTerm.
+							// If it finds an entry in its log with that term,
+							// it should set nextIndex to be the one beyond the index of the last entry in that term in its log.
 
-						// the leader should first search its log for conflictTerm.
-						// If it finds an entry in its log with that term,
-						// it should set nextIndex to be the one beyond the index of the last entry in that term in its log.
-
-						// If it does not find an entry with that term, it should set nextIndex = conflictIndex.
-						sameTermEntry := false
-						conflictTermLast := -1
-						for i := len(rf.Log) - 1; i > 0; i-- {
-							if rf.Log[i].Term == reply.XTerm {
-								sameTermEntry = true
-								conflictTermLast = i
-								break
+							// If it does not find an entry with that term, it should set nextIndex = conflictIndex.
+							sameTermEntry := false
+							conflictTermLast := -1
+							for i := len(rf.Log) - 1; i > 0; i-- {
+								if rf.Log[i].Term == reply.XTerm {
+									sameTermEntry = true
+									conflictTermLast = i
+									break
+								}
 							}
-						}
-						if sameTermEntry {
-							rf.nextIndex[index] = conflictTermLast + 1
-						} else {
-							rf.nextIndex[index] = reply.XIndex
-						}
+							if sameTermEntry {
+								rf.nextIndex[index] = conflictTermLast + 1
+							} else {
+								rf.nextIndex[index] = reply.XIndex
+							}
+						*/
 					}
-					//rf.nextIndex[index] = rf.nextIndex[index] - 1
 				}
 			}
 
@@ -681,6 +707,29 @@ func (rf *Raft) leaderAppendEntries() {
 
 }
 
+//
+// handleLogInconsistency handles the case where AppendEntries fails due to log inconsistency
+//
+// If xTerm is -1, it means that the follower does not have any entry in its log with the same term as the leader.
+// The leader should first search its log for conflictTerm.
+// If it finds an entry in its log with that term, it should set nextIndex to be the one beyond the index of the last entry in that term in its log.
+// If it does not find, it should set nextIndex = conflictIndex.
+
+func (rf *Raft) handleLogInconsistency(index int, reply *AppendEntriesReply) {
+	if reply.XTerm == -1 {
+		rf.nextIndex[index] = reply.XLen
+	} else {
+		target := reply.XIndex
+		for i := len(rf.Log) - 1; i > 0; i-- {
+			if rf.Log[i].Term == reply.XTerm {
+				target = i + 1
+				break
+			}
+		}
+		rf.nextIndex[index] = target
+	}
+}
+
 func (rf *Raft) candidateRequestVote() {
 	rf.mu.Lock()
 	currentTerm := rf.currentTerm
@@ -699,12 +748,8 @@ func (rf *Raft) candidateRequestVote() {
 			args := &RequestVoteArgs{
 				Term:         currentTerm,
 				CandidateId:  candidateId,
-				LastLogIndex: 0,
-				LastLogTerm:  0,
-			}
-			if len(rf.Log) > 1 {
-				args.LastLogIndex = rf.getLastLogIndex()
-				args.LastLogTerm = rf.Log[args.LastLogIndex].Term
+				LastLogIndex: rf.getLastLogIndex(),
+				LastLogTerm:  rf.Log[rf.getLastLogIndex()].Term,
 			}
 			rf.mu.Unlock()
 			reply := &RequestVoteReply{}
@@ -723,15 +768,14 @@ func (rf *Raft) candidateRequestVote() {
 				return
 			}
 
-			PrettyDebug(dVote, "S%d currentTerm is %d, receiveTerm is %d", rf.me, rf.currentTerm, reply.Term)
+			//PrettyDebug(dVote, "S%d currentTerm is %d, receiveTerm is %d", rf.me, rf.currentTerm, reply.Term)
 
 			if reply.Term == rf.currentTerm && rf.state == CANDIDATE {
 				if reply.VoteGranted {
 					rf.getVotesNum += 1
-					PrettyDebug(dVote, "S%d get Vote, has votes %d", rf.me, rf.getVotesNum)
 					if rf.getVotesNum > len(rf.peers)/2 {
 						rf.LeaderState()
-						PrettyDebug(dVote, "S%d becomes LEADER", rf.me)
+						PrettyDebug(dVote, "S%d becomes LEADER, has votes %d", rf.me, rf.getVotesNum)
 					}
 				}
 			}
