@@ -217,8 +217,8 @@ func (rf *Raft) LeaderState() {
 		rf.matchIndex[i] = -1
 	}
 	// reset the commit index and lastApplied
-	rf.commitIndex = 0
-	rf.lastApplied = 0
+	// rf.commitIndex = 0
+	// rf.lastApplied = 0
 }
 
 func (rf *Raft) FollowerState(newTerm int) {
@@ -401,6 +401,17 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		// Set reply
 		reply.Term = rf.currentTerm
 		reply.Success = true
+		// If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry)
+		if args.LeaderCommit > rf.commitIndex {
+			if args.LeaderCommit < rf.getLastLogIndex() {
+				rf.commitIndex = args.LeaderCommit
+			} else {
+				rf.commitIndex = rf.getLastLogIndex()
+			}
+		}
+		fmt.Printf("S%d receive heartBeat, commitIndex %d, LastApplied %d, LogLength %d, Follower's Log", rf.me, rf.commitIndex, rf.lastApplied, len(rf.Log))
+		fmt.Println(rf.Log)
+
 		return
 	}
 
@@ -476,7 +487,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			rf.commitIndex = rf.getLastLogIndex()
 		}
 	}
-	PrettyDebug(dLog, "S%d match at prevLogIndex S%d, current log length %d",
+
+	PrettyDebug(dLog, "S%d match at prevLogIndex %d, current log length %d",
 		rf.me, args.PrevLogIndex, len(rf.Log))
 	// Set reply
 	reply.Term = rf.currentTerm
@@ -553,6 +565,10 @@ func (rf *Raft) leaderAppendEntries() {
 				args.Entries = rf.Log[rf.nextIndex[index]:]
 			}
 			fmt.Println("S", rf.me, "Ledaer send", args)
+
+			rf.nextIndex[rf.me] = rf.getLastLogIndex() + 1
+			rf.matchIndex[rf.me] = rf.getLastLogIndex()
+
 			reply := &AppendEntriesReply{}
 
 			rf.mu.Unlock()
@@ -583,7 +599,7 @@ func (rf *Raft) leaderAppendEntries() {
 			// set commitIndex = N (§5.3, §5.4).
 
 			rf.commitIndex = rf.countReplica()
-
+			fmt.Println("S", rf.me, "count Replica = ", rf.commitIndex)
 			rf.mu.Unlock()
 			// term >= currentTerm
 			// If RPC request or response contains term T > currentTerm:
@@ -639,17 +655,16 @@ func (rf *Raft) candidateRequestVote() {
 
 //
 // the service using Raft (e.g. a k/v server) wants to start
-// agreement on the next command to be appended to Raft's log. if this
-// server isn't the leader, returns false. otherwise start the
-// agreement and return immediately. there is no guarantee that this
-// command will ever be committed to the Raft log, since the leader
-// may fail or lose an election. even if the Raft instance has been killed,
-// this function should return gracefully.
+// agreement on the next command to be appended to Raft's log.
+// if this server isn't the leader, returns false.
+// otherwise start the agreement and return immediately.
+// there is no guarantee that this command will ever be committed to the Raft log, since the leader
+// may fail or lose an election.
+// even if the Raft instance has been killed, this function should return gracefully.
 //
-// the first return value is the index that the command will appear at
-// if it's ever committed. the second return value is the current
-// term. the third return value is true if this server believes it is
-// the leader.
+// the first return value is the index that the command will appear at if it's ever committed.
+// the second return value is the current term.
+// the third return value is true if this server believes it is the leader.
 //
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	index := -1
@@ -660,15 +675,17 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	// Your code here (2B).
 	// even if the Raft instance has been killed, this function should return gracefully.
 	if rf.killed() {
+		isLeader = false
 		return index, term, isLeader
 	}
+
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
 	// if this server isn't the leader, returns false.
 	index = rf.getLastLogIndex() + 1 // the index that the command will appear at if it's ever committed.
 	term = rf.currentTerm
-	isLeader = rf.state == LEADER
+	isLeader = (rf.state == LEADER)
 	if !isLeader {
 		return index, term, false
 	}
@@ -795,20 +812,22 @@ func (rf *Raft) applyChecker() {
 	for rf.killed() == false {
 		if <-ApplyTimeout {
 			rf.mu.Lock()
-			if rf.state != LEADER {
-				rf.mu.Unlock()
-				continue
-			}
+			/*
+				if rf.state != LEADER {
+					rf.mu.Unlock()
+					continue
+				}
+			*/
 			// If commitIndex > lastApplied: increment lastApplied, apply log[lastApplied] to state machine (§5.3)
 			if rf.commitIndex > rf.lastApplied {
-				PrettyDebug(dLog, "S%d Apply Entries at %d", rf.me, rf.lastApplied)
+				rf.lastApplied++
+				PrettyDebug(dLog, "S%d Apply Entries at %d, commitIndex is %d", rf.me, rf.lastApplied, rf.commitIndex)
 				applyMsg := ApplyMsg{
 					CommandValid: true,
 					Command:      rf.Log[rf.lastApplied].Command,
 					CommandIndex: rf.lastApplied,
 				}
 				rf.applyCh <- applyMsg
-				rf.lastApplied++
 			}
 			rf.mu.Unlock()
 		}
