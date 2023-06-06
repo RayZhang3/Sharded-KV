@@ -21,13 +21,13 @@ import (
 	//	"bytes"
 
 	"math/rand"
+	"strings"
 	"sync"
 	"sync/atomic"
 
 	//	"6.824/labgob"
 	"fmt"
 
-	"strings"
 	"time"
 
 	"6.824/labrpc"
@@ -140,11 +140,14 @@ func (entry LogEntry) String() string {
 }
 
 func getLogString(logs []LogEntry) string {
+	//return " "
+
 	strs := make([]string, len(logs))
 	for i, entry := range logs {
 		strs[i] = entry.String()
 	}
 	return "[" + strings.Join(strs, ", ") + "]"
+
 }
 
 // If there exists an N such that
@@ -233,6 +236,11 @@ type AppendEntriesReply struct {
 	Term             int  // currentTerm, for leader to update itself
 	Success          bool // true if follower contained entry matching prevLogIndex and prevLogTerm
 	LogInconsistency bool // true if Log mismatch, nextIndex--
+
+	// Lab 2B Fast Backup
+	XTerm  int // term of conflicting term
+	XIndex int // first index of conflicting term
+	XLen   int // length of log (Empty)
 }
 
 func (aer AppendEntriesReply) String() string {
@@ -410,15 +418,14 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 // Write an AppendEntries RPC handler method that resets the election timeout
 // so that other servers don't step forward as leaders when one has already been elected.
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	// Lab 2A
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 
 	infoString := fmt.Sprintf("Term %d, LeaderId:%d, PrevLogIndex:%d, PrevLogTerm:%d, LeaderCommit:%d, Entries %s",
 		args.Term, args.LeaderId, args.PrevLogIndex, args.PrevLogTerm, args.LeaderCommit, getLogString(args.Entries))
 
 	PrettyDebug(dVote, "S%d receive AppendEntries from S%d: %s", rf.me, args.LeaderId, infoString)
-
-	// Lab 2A
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
 
 	// If RPC request or response contains term T > currentTerm: set currentTerm = T, convert to follower
 	if args.Term > rf.currentTerm {
@@ -444,6 +451,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		PrettyDebug(dVote, "S%d receive heartBeat from S%d, info: %s", rf.me, args.LeaderId, heartBeatString)
 	}
 
+	if args.PrevLogIndex < rf.commitIndex {
+		reply.XTerm = rf.Log[rf.commitIndex].Term
+		reply.XIndex = rf.commitIndex + 1
+		return
+	}
 	// Log misamtch
 	// Reply false if log doesn’t contain an entry at prevLogIndex whose term matches prevLogTerm
 	contains, prevEntry := rf.getLogAt(args.PrevLogIndex)
@@ -451,6 +463,15 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.Term = rf.currentTerm
 		reply.Success = false
 		reply.LogInconsistency = true
+		// fast backup
+		if !contains {
+			reply.XTerm = -1
+			reply.XLen = len(rf.Log)
+		} else {
+			reply.XTerm = prevEntry.Term
+			reply.XIndex = rf.getSameTermFirst(args.PrevLogIndex)
+		}
+
 		PrettyDebug(dLog2, "S%d mismatch at prevLogIndex %d, current log length %d",
 			rf.me, args.PrevLogIndex, len(rf.Log))
 		return
@@ -472,20 +493,23 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	// Append any new entries not already in the log
 
-	for i, j := 0, args.PrevLogIndex+1; i < len(args.Entries); i, j = i+1, j+1 {
-		// Reach the end of Log
-		if j >= len(rf.Log) {
-			rf.Log = append(rf.Log, args.Entries[i])
-			//fmt.Println("rf.Log", rf.Log)
-			continue
+	startAppendIndex := args.PrevLogIndex + 1
+	// Check if we've reached the end of Log
+	if startAppendIndex >= len(rf.Log) {
+		rf.Log = append(rf.Log, args.Entries...)
+	} else {
+		// Same LogEntry, do nothing
+		// Different log, should not happen due to prior conflict resolution
+		for i := 0; i < len(args.Entries); i++ {
+			if startAppendIndex+i >= len(rf.Log) {
+				rf.Log = append(rf.Log, args.Entries[i])
+				continue
+			}
+			if args.Entries[i].Term != rf.Log[startAppendIndex+i].Term {
+				PrettyDebug(dLog2, "S%d Error, has conflits in new AppendLog %s", rf.me, getLogString(rf.Log))
+				break
+			}
 		}
-		// Same LogEntry
-		if args.Entries[i].Term == rf.Log[j].Term {
-			continue
-		} else { // Different log? I don't think it should be here
-			PrettyDebug(dLog2, "S%d Error, has conflits in new AppendLog %s", rf.me, getLogString(rf.Log))
-		}
-
 	}
 
 	// If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry)
@@ -545,6 +569,9 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 
 func (rf *Raft) leaderAppendEntries() {
 	for i := 0; i < len(rf.peers); i++ {
+		if rf.killed() {
+			return
+		}
 		if i == rf.me {
 			continue
 		}
@@ -569,11 +596,15 @@ func (rf *Raft) leaderAppendEntries() {
 				args.PrevLogIndex = rf.nextIndex[index] - 1
 				args.PrevLogTerm = rf.Log[args.PrevLogIndex].Term
 			}
+
 			if rf.getLastLogIndex() >= rf.nextIndex[index] {
-				args.Entries = rf.Log[rf.nextIndex[index]:]
+				entries := rf.Log[rf.nextIndex[index]:]
+				logCopy := make([]LogEntry, len(entries))
+				copy(logCopy, entries)
+				args.Entries = logCopy
 			}
 
-			PrettyDebug(dLog, "S%d send AppendEntries: %s", rf.me, args.String())
+			PrettyDebug(dLog, "S%d send AppendEntries to S%d : %s, Log%s", rf.me, index, args.String(), getLogString(rf.Log))
 
 			// set Leader's nextIndex and matchIndex
 			rf.nextIndex[rf.me] = rf.getLastLogIndex() + 1
@@ -593,6 +624,11 @@ func (rf *Raft) leaderAppendEntries() {
 				return
 			}
 
+			if rf.state != LEADER || rf.currentTerm != args.Term {
+				rf.mu.Unlock()
+				return
+			}
+
 			// If successful: update nextIndex and matchIndex for follower (§5.3)
 			// If AppendEntries fails because of log inconsistency: decrement nextIndex and retry (§5.3)
 			if reply.Success {
@@ -600,7 +636,31 @@ func (rf *Raft) leaderAppendEntries() {
 				rf.nextIndex[index] = rf.matchIndex[index] + 1
 			} else {
 				if reply.LogInconsistency {
-					rf.nextIndex[index] = rf.nextIndex[index] - 1
+					if reply.XTerm == -1 {
+						rf.nextIndex[index] = reply.XLen
+					} else {
+
+						// the leader should first search its log for conflictTerm.
+						// If it finds an entry in its log with that term,
+						// it should set nextIndex to be the one beyond the index of the last entry in that term in its log.
+
+						// If it does not find an entry with that term, it should set nextIndex = conflictIndex.
+						sameTermEntry := false
+						conflictTermLast := -1
+						for i := len(rf.Log) - 1; i > 0; i-- {
+							if rf.Log[i].Term == reply.XTerm {
+								sameTermEntry = true
+								conflictTermLast = i
+								break
+							}
+						}
+						if sameTermEntry {
+							rf.nextIndex[index] = conflictTermLast + 1
+						} else {
+							rf.nextIndex[index] = reply.XIndex
+						}
+					}
+					//rf.nextIndex[index] = rf.nextIndex[index] - 1
 				}
 			}
 
@@ -609,14 +669,16 @@ func (rf *Raft) leaderAppendEntries() {
 			// set commitIndex = N (§5.3, §5.4).
 
 			rf.commitIndex = rf.countReplica()
+			//PrettyDebug(dLog, "S%d finished send AppendEntries: %s", rf.me, rf.String())
 
 			rf.mu.Unlock()
 			// term >= currentTerm
 			// If RPC request or response contains term T > currentTerm:
 			// Set currentTerm = T, convert to follower
+
 		}(i)
 	}
-	PrettyDebug(dLog, "S%d finished send AppendEntries: %s", rf.me, rf.String())
+
 }
 
 func (rf *Raft) candidateRequestVote() {
@@ -626,10 +688,14 @@ func (rf *Raft) candidateRequestVote() {
 	rf.mu.Unlock()
 
 	for i := 0; i < len(rf.peers); i++ {
+		if rf.killed() {
+			return
+		}
 		if i == rf.me {
 			continue
 		}
 		go func(index int) {
+			rf.mu.Lock()
 			args := &RequestVoteArgs{
 				Term:         currentTerm,
 				CandidateId:  candidateId,
@@ -640,6 +706,7 @@ func (rf *Raft) candidateRequestVote() {
 				args.LastLogIndex = rf.getLastLogIndex()
 				args.LastLogTerm = rf.Log[args.LastLogIndex].Term
 			}
+			rf.mu.Unlock()
 			reply := &RequestVoteReply{}
 
 			rf.sendRequestVote(index, args, reply)
@@ -649,6 +716,11 @@ func (rf *Raft) candidateRequestVote() {
 			// If RPC request or response contains termT > currentTerm: set currentTerm = T, convert to follower
 			if reply.Term > rf.currentTerm {
 				rf.FollowerState(reply.Term)
+			}
+
+			if rf.state != CANDIDATE || rf.currentTerm != args.Term {
+				rf.mu.Unlock()
+				return
 			}
 
 			PrettyDebug(dVote, "S%d currentTerm is %d, receiveTerm is %d", rf.me, rf.currentTerm, reply.Term)
@@ -669,8 +741,7 @@ func (rf *Raft) candidateRequestVote() {
 }
 
 //
-// the service using Raft (e.g. a k/v server) wants to start
-// agreement on the next command to be appended to Raft's log.
+// the service using Raft (e.g. a k/v server) wants to start agreement on the next command to be appended to Raft's log.
 // if this server isn't the leader, returns false.
 // otherwise start the agreement and return immediately.
 // there is no guarantee that this command will ever be committed to the Raft log, since the leader
@@ -702,7 +773,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	term = rf.currentTerm
 	isLeader = (rf.state == LEADER)
 	if !isLeader {
-		return index, term, false
+		return -1, -1, false
 	}
 	entry := LogEntry{Term: term, Command: command}
 	rf.Log = append(rf.Log, entry)
@@ -749,8 +820,9 @@ func (rf *Raft) heartBeat() {
 				rf.mu.Unlock()
 				continue
 			}
+			//PrettyDebug(dVote, "S%d tries to Append Entries, State %s", rf.me, rf.String())
 			rf.mu.Unlock()
-			PrettyDebug(dVote, "S%d Append Entries", rf.me)
+
 			rf.leaderAppendEntries()
 		}
 		time.Sleep(10 * time.Millisecond)
@@ -797,10 +869,9 @@ func (rf *Raft) ticker() {
 			randTime = randNum * 1000000
 
 			rf.lastTimeHeared = currentTime
+			PrettyDebug(dVote, "S%d request for vote", rf.me)
 
 			rf.mu.Unlock()
-
-			PrettyDebug(dVote, "S%d request for vote", rf.me)
 			rf.candidateRequestVote()
 		}
 		time.Sleep(10 * time.Millisecond)
@@ -830,14 +901,14 @@ func (rf *Raft) applyChecker() {
 
 			// If commitIndex > lastApplied: increment lastApplied, apply log[lastApplied] to state machine (§5.3)
 			if rf.commitIndex > rf.lastApplied {
-				rf.lastApplied++
-				PrettyDebug(dLog, "S%d Apply Entries at %d, commitIndex is %d", rf.me, rf.lastApplied, rf.commitIndex)
+				PrettyDebug(dLog, "S%d Apply Entries at %d, commitIndex is %d, Log is %s ", rf.me, rf.lastApplied, rf.commitIndex, getLogString(rf.Log))
 				applyMsg := ApplyMsg{
 					CommandValid: true,
-					Command:      rf.Log[rf.lastApplied].Command,
-					CommandIndex: rf.lastApplied,
+					Command:      rf.Log[rf.lastApplied+1].Command,
+					CommandIndex: rf.lastApplied + 1,
 				}
 				rf.applyCh <- applyMsg
+				rf.lastApplied++
 			}
 			rf.mu.Unlock()
 		}
