@@ -485,7 +485,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if args.Term < rf.currentTerm {
 		reply.Term = rf.currentTerm
 		reply.Success = false
-		rf.persist()
 		PrettyDebug(dVote, "S%d refuse to AppendEntries from S%d, my Term: %d, candidate Term: %d",
 			rf.me, args.LeaderId, rf.currentTerm, args.Term)
 		return
@@ -670,18 +669,24 @@ func (rf *Raft) leaderAppendEntries() {
 
 			reply := &AppendEntriesReply{}
 			/*
-				send := false
-				for !send && !rf.killed() {
+				sendAppendSuccess := false
+				for !rf.killed() && !sendAppendSuccess && rf.state == LEADER && rf.currentTerm == args.Term {
 					if rf.state != LEADER || rf.currentTerm != args.Term {
 						rf.mu.Unlock()
 						return
 					}
 					rf.mu.Unlock()
 					ok := rf.sendAppendEntries(index, args, reply)
-					send = ok
+					sendAppendSuccess = ok
+					if !ok {
+						PrettyDebug(dLog2, "S%d send AppendEntries error", args.LeaderId)
+						time.Sleep(2e8)
+					}
 					rf.mu.Lock()
 				}
 			*/
+			PrettyDebug(dLog, "S%d send AppendEntries success", args.LeaderId)
+
 			if rf.state != LEADER || rf.currentTerm != args.Term {
 				rf.mu.Unlock()
 				return
@@ -690,11 +695,11 @@ func (rf *Raft) leaderAppendEntries() {
 
 			ok := rf.sendAppendEntries(index, args, reply)
 			if !ok {
-				PrettyDebug("Log", "S%d send AppendEntries Fail", args.LeaderId)
+				PrettyDebug(dLog, "S%d send AppendEntries error", args.LeaderId)
 			}
+			rf.mu.Lock()
 
 			// If RPC request or response contains term T > currentTerm: set currentTerm = T, convert to follower
-			rf.mu.Lock()
 
 			if reply.Term > rf.currentTerm {
 				rf.FollowerState(reply.Term)
@@ -763,38 +768,48 @@ func (rf *Raft) handleLogInconsistency(index int, reply *AppendEntriesReply) {
 }
 
 func (rf *Raft) candidateRequestVote() {
-	rf.mu.Lock()
-	currentTerm := rf.currentTerm
-	candidateId := rf.me
-	rf.mu.Unlock()
 
 	for i := 0; i < len(rf.peers); i++ {
-		if rf.killed() && rf.state != CANDIDATE {
-			return
-		}
 		if i == rf.me {
 			continue
 		}
+		rf.mu.Lock()
+		if rf.killed() && rf.state != CANDIDATE {
+			return
+		}
+		rf.mu.Unlock()
 		go func(index int) {
 			rf.mu.Lock()
 			args := &RequestVoteArgs{
-				Term:         currentTerm,
-				CandidateId:  candidateId,
+				Term:         rf.currentTerm,
+				CandidateId:  rf.me,
 				LastLogIndex: rf.getLastLogIndex(),
 				LastLogTerm:  rf.Log[rf.getLastLogIndex()].Term,
 			}
 
 			reply := &RequestVoteReply{}
 
-			if rf.state != CANDIDATE || rf.currentTerm != args.Term {
+			if rf.killed() || rf.state != CANDIDATE || rf.currentTerm != args.Term {
 				rf.mu.Unlock()
 				return
 			}
 			rf.mu.Unlock()
-
 			rf.sendRequestVote(index, args, reply)
-
 			rf.mu.Lock()
+
+			/*
+				requestSuccess := false
+				for !rf.killed() && !requestSuccess && rf.state == CANDIDATE && rf.currentTerm == args.Term {
+					rf.mu.Unlock()
+					ok := rf.sendRequestVote(index, args, reply)
+					requestSuccess = ok
+					if !requestSuccess {
+						PrettyDebug(dVote, "S%d RequestVote error", args.CandidateId)
+						time.Sleep(1e8)
+					}
+					rf.mu.Lock()
+				}
+			*/
 
 			// If RPC request or response contains termT > currentTerm: set currentTerm = T, convert to follower
 			if reply.Term > rf.currentTerm {
@@ -891,7 +906,7 @@ func (rf *Raft) heartBeat() {
 	HeartbeatTimeout := make(chan bool)
 	go func() {
 		for {
-			time.Sleep(1e8)
+			time.Sleep(5e7)
 			HeartbeatTimeout <- true
 		}
 	}()
@@ -957,7 +972,7 @@ func (rf *Raft) ticker() {
 
 			currentTime = time.Now() // add this line
 
-			//reset timer
+			// reset timer
 			rf.lastTimeHeared = currentTime
 			PrettyDebug(dVote, "S%d request for vote", rf.me)
 
