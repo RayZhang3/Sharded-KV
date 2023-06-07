@@ -788,32 +788,33 @@ func (rf *Raft) candidateRequestVote() {
 			}
 
 			reply := &RequestVoteReply{}
-
-			if rf.killed() || rf.state != CANDIDATE || rf.currentTerm != args.Term {
-				rf.mu.Unlock()
-				return
-			}
-			rf.mu.Unlock()
-			rf.sendRequestVote(index, args, reply)
-			rf.mu.Lock()
-
 			/*
-				requestSuccess := false
-				for !rf.killed() && !requestSuccess && rf.state == CANDIDATE && rf.currentTerm == args.Term {
+				if rf.killed() || rf.state != CANDIDATE || rf.currentTerm != args.Term {
 					rf.mu.Unlock()
-					ok := rf.sendRequestVote(index, args, reply)
-					requestSuccess = ok
-					if !requestSuccess {
-						PrettyDebug(dVote, "S%d RequestVote error", args.CandidateId)
-						time.Sleep(1e8)
-					}
-					rf.mu.Lock()
+					return
 				}
+				rf.mu.Unlock()
+				rf.sendRequestVote(index, args, reply)
+				rf.mu.Lock()
 			*/
+
+			requestSuccess := false
+			for !rf.killed() && !requestSuccess && rf.state == CANDIDATE && rf.currentTerm == args.Term {
+				rf.mu.Unlock()
+				ok := rf.sendRequestVote(index, args, reply)
+				requestSuccess = ok
+				if !requestSuccess {
+					PrettyDebug(dVote, "S%d RequestVote error", args.CandidateId)
+					time.Sleep(2e8)
+				}
+				rf.mu.Lock()
+			}
 
 			// If RPC request or response contains termT > currentTerm: set currentTerm = T, convert to follower
 			if reply.Term > rf.currentTerm {
 				rf.FollowerState(reply.Term)
+				rf.mu.Unlock()
+				return
 			}
 
 			if rf.state != CANDIDATE || rf.currentTerm != args.Term {
@@ -934,9 +935,9 @@ func (rf *Raft) ticker() {
 
 	// Election time out
 	// generate a random number from 1e9 to 2e9, type uint64
-	randNum := int64(1000 + rand.Intn(1000))
+	randNum := int64(1000 + rand.Intn(500))
 	var randTime int64
-	randTime = randNum * 1000000 // 1s - 2s
+	randTime = randNum * 1000000 // 1- 1.5s
 	rf.mu.Lock()
 	rf.lastTimeHeared = time.Now()
 	rf.mu.Unlock()
@@ -967,7 +968,7 @@ func (rf *Raft) ticker() {
 			}
 			rf.CandidateState()
 
-			randNum = int64(1000 + rand.Intn(1000)) //1-2s
+			randNum = int64(1000 + rand.Intn(500)) //1-1.5s
 			randTime = randNum * 1000000
 
 			currentTime = time.Now() // add this line
