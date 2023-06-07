@@ -430,11 +430,9 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		reply.VoterId = rf.me
 		// Set votedFor
 		rf.votedFor = args.CandidateId
-
+		rf.persist()
 		// Reset timer
 		rf.lastTimeHeared = time.Now()
-		rf.persist()
-
 		PrettyDebug(dVote, "S%d vote for S%d, candidate Term: %d", rf.me, args.CandidateId, args.Term)
 
 	} else {
@@ -508,8 +506,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// So, we need to set the conflits Log Entry after committed Log Entries.
 
 	if args.PrevLogIndex < rf.commitIndex {
+		reply.Term = rf.currentTerm
+		reply.Success = false
 		reply.XTerm = rf.Log[rf.commitIndex].Term
 		reply.XIndex = rf.commitIndex + 1
+		reply.LogInconsistency = true
 		return
 	}
 
@@ -570,6 +571,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			}
 		}
 	}
+
 	if needPersist {
 		rf.persist()
 	}
@@ -667,16 +669,33 @@ func (rf *Raft) leaderAppendEntries() {
 			rf.matchIndex[rf.me] = rf.getLastLogIndex()
 
 			reply := &AppendEntriesReply{}
+			/*
+				send := false
+				for !send && !rf.killed() {
+					if rf.state != LEADER || rf.currentTerm != args.Term {
+						rf.mu.Unlock()
+						return
+					}
+					rf.mu.Unlock()
+					ok := rf.sendAppendEntries(index, args, reply)
+					send = ok
+					rf.mu.Lock()
+				}
+			*/
 			if rf.state != LEADER || rf.currentTerm != args.Term {
 				rf.mu.Unlock()
 				return
 			}
 			rf.mu.Unlock()
 
-			rf.sendAppendEntries(index, args, reply)
+			ok := rf.sendAppendEntries(index, args, reply)
+			if !ok {
+				PrettyDebug("Log", "S%d send AppendEntries Fail", args.LeaderId)
+			}
 
 			// If RPC request or response contains term T > currentTerm: set currentTerm = T, convert to follower
 			rf.mu.Lock()
+
 			if reply.Term > rf.currentTerm {
 				rf.FollowerState(reply.Term)
 				rf.mu.Unlock()
@@ -750,7 +769,7 @@ func (rf *Raft) candidateRequestVote() {
 	rf.mu.Unlock()
 
 	for i := 0; i < len(rf.peers); i++ {
-		if rf.killed() {
+		if rf.killed() && rf.state != CANDIDATE {
 			return
 		}
 		if i == rf.me {
@@ -764,8 +783,14 @@ func (rf *Raft) candidateRequestVote() {
 				LastLogIndex: rf.getLastLogIndex(),
 				LastLogTerm:  rf.Log[rf.getLastLogIndex()].Term,
 			}
-			rf.mu.Unlock()
+
 			reply := &RequestVoteReply{}
+
+			if rf.state != CANDIDATE || rf.currentTerm != args.Term {
+				rf.mu.Unlock()
+				return
+			}
+			rf.mu.Unlock()
 
 			rf.sendRequestVote(index, args, reply)
 
@@ -781,7 +806,7 @@ func (rf *Raft) candidateRequestVote() {
 				return
 			}
 
-			//PrettyDebug(dVote, "S%d currentTerm is %d, receiveTerm is %d", rf.me, rf.currentTerm, reply.Term)
+			// PrettyDebug(dVote, "S%d currentTerm is %d, receiveTerm is %d", rf.me, rf.currentTerm, reply.Term)
 
 			if reply.Term == rf.currentTerm && rf.state == CANDIDATE {
 				if reply.VoteGranted {
@@ -926,9 +951,13 @@ func (rf *Raft) ticker() {
 				continue
 			}
 			rf.CandidateState()
-			randNum = int64(1000 + rand.Intn(500)) //1-1.5s
+
+			randNum = int64(1000 + rand.Intn(1000)) //1-2s
 			randTime = randNum * 1000000
 
+			currentTime = time.Now() // add this line
+
+			//reset timer
 			rf.lastTimeHeared = currentTime
 			PrettyDebug(dVote, "S%d request for vote", rf.me)
 
@@ -952,7 +981,8 @@ func (rf *Raft) applyChecker() {
 	ApplyTimeout := make(chan bool)
 	go func() {
 		for {
-			time.Sleep(2e8)
+			//time.Sleep(1e8)
+			time.Sleep(2e7)
 			ApplyTimeout <- true
 		}
 	}()
@@ -1062,6 +1092,5 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	go rf.heartBeat()
 	go rf.applyChecker()
 
-	//PrettyDebug(dTest, "S%d created", rf.me)
 	return rf
 }
