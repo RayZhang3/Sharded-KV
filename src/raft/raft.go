@@ -20,6 +20,7 @@ package raft
 import (
 	//	"bytes"
 
+	"bytes"
 	"math/rand"
 	"strings"
 	"sync"
@@ -30,6 +31,7 @@ import (
 
 	"time"
 
+	"6.824/labgob"
 	"6.824/labrpc"
 )
 
@@ -155,8 +157,19 @@ func getLogString(logs []LogEntry) string {
 // set commitIndex = N (§5.3, §5.4).
 
 func (rf *Raft) countReplica() int {
-	first := rf.getSameTermFirst(rf.getLastLogIndex())
-	end := rf.getLastLogIndex()
+	//first := rf.getSameTermFirst(rf.getLastLogIndex())
+	if rf.Log[len(rf.Log)-1].Term != rf.currentTerm {
+		return -1
+	}
+	first := -1
+	for i := 0; i < len(rf.Log); i++ {
+		if rf.Log[i].Term == rf.currentTerm {
+			first = i
+			break
+		}
+	}
+	end := len(rf.Log) - 1
+
 	N := rf.commitIndex
 	for i := end; i > rf.commitIndex && i >= first; i-- {
 		replica := 1
@@ -285,6 +298,7 @@ func (rf *Raft) FollowerState(newTerm int) {
 	rf.currentTerm = newTerm
 	rf.votedFor = -1 // reset the vote
 	rf.getVotesNum = 0
+	rf.persist()
 }
 
 func (rf *Raft) CandidateState() {
@@ -292,6 +306,7 @@ func (rf *Raft) CandidateState() {
 	rf.currentTerm += 1
 	rf.votedFor = rf.me
 	rf.getVotesNum = 1 // vote for itself
+	rf.persist()
 	PrettyDebug(dVote, "S%d becomes CANDIDATE", rf.me)
 }
 
@@ -319,12 +334,13 @@ func (rf *Raft) GetState() (int, bool) {
 func (rf *Raft) persist() {
 	// Your code here (2C).
 	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// data := w.Bytes()
-	// rf.persister.SaveRaftState(data)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.Log)
+	data := w.Bytes()
+	rf.persister.SaveRaftState(data)
 }
 
 //
@@ -336,17 +352,20 @@ func (rf *Raft) readPersist(data []byte) {
 	}
 	// Your code here (2C).
 	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var currentTerm int
+	var votedFor int
+	var Log []LogEntry
+	if d.Decode(&currentTerm) != nil || d.Decode(&votedFor) != nil || d.Decode(&Log) != nil {
+		PrettyDebug(dPersist, "S%d Persist error", rf.me)
+	} else {
+		rf.mu.Lock()
+		rf.currentTerm = currentTerm
+		rf.votedFor = votedFor
+		rf.Log = Log
+		rf.mu.Unlock()
+	}
 }
 
 //
@@ -390,6 +409,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		reply.VoteGranted = false
 		PrettyDebug(dVote, "S%d refuse to vote for S%d, my Term: %d, candidate Term: %d",
 			rf.me, args.CandidateId, rf.currentTerm, args.Term)
+		rf.persist()
 		return
 	}
 
@@ -410,10 +430,13 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		reply.VoterId = rf.me
 		// Set votedFor
 		rf.votedFor = args.CandidateId
+
 		// Reset timer
 		rf.lastTimeHeared = time.Now()
+		rf.persist()
 
 		PrettyDebug(dVote, "S%d vote for S%d, candidate Term: %d", rf.me, args.CandidateId, args.Term)
+
 	} else {
 		// Set reply
 		reply.Term = rf.currentTerm
@@ -455,7 +478,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.debugAppendEntries(args)
 
 	// If RPC request or response contains term T > currentTerm: set currentTerm = T, convert to follower
-	if args.Term > rf.currentTerm {
+	// If AppendEntries RPC received from new leader: convert to follower
+	if args.Term > rf.currentTerm || (args.Term == rf.currentTerm && rf.state == CANDIDATE) {
 		rf.FollowerState(args.Term)
 	}
 
@@ -463,6 +487,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if args.Term < rf.currentTerm {
 		reply.Term = rf.currentTerm
 		reply.Success = false
+		rf.persist()
 		PrettyDebug(dVote, "S%d refuse to AppendEntries from S%d, my Term: %d, candidate Term: %d",
 			rf.me, args.LeaderId, rf.currentTerm, args.Term)
 		return
@@ -509,6 +534,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 
+	needPersist := false
 	// If an existing entry conflicts with a new one (same index but different terms),
 	// delete the existing entry and all that follow it
 
@@ -517,6 +543,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			rf.debugConflictsLog(args)
 			rf.Log = rf.Log[:j]
 			PrettyDebug(dLog2, "S%d Log after conflits: %s", rf.me, getLogString(rf.Log))
+			needPersist = true
 			break
 		}
 	}
@@ -527,12 +554,14 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// Check if we've reached the end of Log
 	if startAppendIndex >= len(rf.Log) {
 		rf.Log = append(rf.Log, args.Entries...)
+		needPersist = true
 	} else {
 		// Same LogEntry, do nothing
 		// Different log, should not happen due to prior conflict resolution
 		for i := 0; i < len(args.Entries); i++ {
 			if startAppendIndex+i >= len(rf.Log) {
 				rf.Log = append(rf.Log, args.Entries[i])
+				needPersist = true
 				continue
 			}
 			if args.Entries[i].Term != rf.Log[startAppendIndex+i].Term {
@@ -540,6 +569,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 				break
 			}
 		}
+	}
+	if needPersist {
+		rf.persist()
 	}
 
 	// If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry)
@@ -635,7 +667,10 @@ func (rf *Raft) leaderAppendEntries() {
 			rf.matchIndex[rf.me] = rf.getLastLogIndex()
 
 			reply := &AppendEntriesReply{}
-
+			if rf.state != LEADER || rf.currentTerm != args.Term {
+				rf.mu.Unlock()
+				return
+			}
 			rf.mu.Unlock()
 
 			rf.sendAppendEntries(index, args, reply)
@@ -663,29 +698,7 @@ func (rf *Raft) leaderAppendEntries() {
 					if reply.XTerm == -1 {
 						rf.nextIndex[index] = reply.XLen
 					} else {
-						// set nextIndex according to the reply
 						rf.handleLogInconsistency(index, reply)
-						/*
-							// the leader should first search its log for conflictTerm.
-							// If it finds an entry in its log with that term,
-							// it should set nextIndex to be the one beyond the index of the last entry in that term in its log.
-
-							// If it does not find an entry with that term, it should set nextIndex = conflictIndex.
-							sameTermEntry := false
-							conflictTermLast := -1
-							for i := len(rf.Log) - 1; i > 0; i-- {
-								if rf.Log[i].Term == reply.XTerm {
-									sameTermEntry = true
-									conflictTermLast = i
-									break
-								}
-							}
-							if sameTermEntry {
-								rf.nextIndex[index] = conflictTermLast + 1
-							} else {
-								rf.nextIndex[index] = reply.XIndex
-							}
-						*/
 					}
 				}
 			}
@@ -822,6 +835,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	entry := LogEntry{Term: term, Command: command}
 	rf.Log = append(rf.Log, entry)
 
+	rf.persist()
+
 	return index, term, isLeader
 }
 
@@ -882,11 +897,13 @@ func (rf *Raft) ticker() {
 	randNum := int64(1000 + rand.Intn(1000))
 	var randTime int64
 	randTime = randNum * 1000000 // 1s - 2s
+	rf.mu.Lock()
 	rf.lastTimeHeared = time.Now()
+	rf.mu.Unlock()
 	PeriodicTimeout := make(chan bool)
 	go func() {
 		for {
-			time.Sleep(2e7)
+			time.Sleep(3e7)
 			PeriodicTimeout <- true
 		}
 	}()
@@ -909,7 +926,7 @@ func (rf *Raft) ticker() {
 				continue
 			}
 			rf.CandidateState()
-			randNum = int64(1000 + rand.Intn(1000))
+			randNum = int64(1000 + rand.Intn(500)) //1-1.5s
 			randTime = randNum * 1000000
 
 			rf.lastTimeHeared = currentTime
@@ -935,24 +952,29 @@ func (rf *Raft) applyChecker() {
 	ApplyTimeout := make(chan bool)
 	go func() {
 		for {
-			time.Sleep(1e8)
+			time.Sleep(2e8)
 			ApplyTimeout <- true
 		}
 	}()
 	for rf.killed() == false {
 		if <-ApplyTimeout {
 			rf.mu.Lock()
-
+			commmitIndex := rf.commitIndex
+			LastLogIndex := rf.getLastLogIndex()
 			// If commitIndex > lastApplied: increment lastApplied, apply log[lastApplied] to state machine (§5.3)
-			if rf.commitIndex > rf.lastApplied {
-				PrettyDebug(dLog, "S%d Apply Entries at %d, commitIndex is %d, Log is %s ", rf.me, rf.lastApplied, rf.commitIndex, getLogString(rf.Log))
-				applyMsg := ApplyMsg{
-					CommandValid: true,
-					Command:      rf.Log[rf.lastApplied+1].Command,
-					CommandIndex: rf.lastApplied + 1,
+			if commmitIndex > rf.lastApplied {
+				for (rf.lastApplied < commmitIndex) && (rf.lastApplied < LastLogIndex) {
+					PrettyDebug(dLog, "S%d Apply Entries at %d, commitIndex is %d, Log is %s ", rf.me, rf.lastApplied, rf.commitIndex, getLogString(rf.Log))
+					rf.lastApplied++
+					applyMsg := ApplyMsg{
+						CommandValid: true,
+						Command:      rf.Log[rf.lastApplied].Command,
+						CommandIndex: rf.lastApplied,
+					}
+					rf.mu.Unlock()
+					rf.applyCh <- applyMsg
+					rf.mu.Lock()
 				}
-				rf.applyCh <- applyMsg
-				rf.lastApplied++
 			}
 			rf.mu.Unlock()
 		}
