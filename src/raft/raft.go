@@ -98,6 +98,12 @@ type Raft struct {
 
 	//Lab 2B
 	applyCh chan ApplyMsg
+
+	// Lab2D
+	lastIncludedIndex int
+	lastIncludedTerm  int
+	snapShot          []byte
+	firstIndex        int
 	// End
 }
 
@@ -504,14 +510,19 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	//    because of poor network, the nextIndex is finally less than the commitIndex of the follower.
 	// So, we need to set the conflits Log Entry after committed Log Entries.
 
-	if args.PrevLogIndex < rf.commitIndex {
-		reply.Term = rf.currentTerm
-		reply.Success = false
-		reply.XTerm = rf.Log[rf.commitIndex].Term
-		reply.XIndex = rf.commitIndex + 1
-		reply.LogInconsistency = true
-		return
-	}
+	/*
+		if args.PrevLogIndex < rf.commitIndex {
+			reply.Term = rf.currentTerm
+			reply.Success = false
+			reply.XTerm = rf.Log[rf.commitIndex].Term
+			reply.XIndex = rf.commitIndex + 1
+			reply.LogInconsistency = true
+			PrettyDebug(dError, "S%d send AppendEntries to S%d, but S%d's PrevLogIndex is %d, less than S%d' commitIndex ",
+				args.LeaderId, rf.me, args.LeaderId, args.PrevLogIndex, rf.me, rf.commitIndex)
+			PrettyDebug(dError, "S%d' Follower's Log is %s", rf.me, getLogString(rf.Log))
+			return
+		}
+	*/
 
 	// Log misamtch
 	// Reply false if log doesn’t contain an entry at prevLogIndex whose term matches prevLogTerm
@@ -1099,6 +1110,11 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	*/
 
 	// End
+
+	// Lab 2D
+	rf.lastIncludedIndex = -1
+	rf.lastIncludedTerm = -1
+	rf.snapShot = nil
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
