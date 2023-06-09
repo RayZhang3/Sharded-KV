@@ -131,7 +131,7 @@ func (rf *Raft) getLastLogIndex() int {
 			return rf.lastIncludedIndex
 		}
 	default:
-		return rf.Log[len(rf.Log)-1].Index
+		return (len(rf.Log) - 1) + rf.firstIndex
 	}
 }
 
@@ -197,7 +197,11 @@ func (rf *Raft) countReplica() int {
 		if rf.lastIncludedIndex == -1 && rf.lastIncludedTerm == -1 {
 			return 0
 		} else {
-			return rf.lastIncludedIndex
+			if rf.lastIncludedIndex >= rf.commitIndex {
+				return rf.lastIncludedIndex
+			} else {
+				return rf.commitIndex
+			}
 		}
 	}
 
@@ -222,7 +226,7 @@ func (rf *Raft) countReplica() int {
 			}
 		}
 		if replica > len(rf.peers)/2 {
-			N = i
+			N = i + rf.firstIndex
 			break
 		}
 	}
@@ -276,6 +280,11 @@ type InstallSnapshotArgs struct {
 	LastIncludedIndex int
 	LastIncludedTerm  int
 	Data              []byte
+}
+
+func (rvr InstallSnapshotArgs) String() string {
+	return fmt.Sprintf("InstallSnapshotArgs{Term: %d, LeaderId: %d, LastIncludedIndex: %d, LastIncludedTerm: %d, Data: %s}",
+		rvr.Term, rvr.LeaderId, rvr.LastIncludedIndex, rvr.LastIncludedTerm, string(rvr.Data))
 }
 
 type InstallSnapshotReply struct {
@@ -439,7 +448,7 @@ func (rf *Raft) readPersist(data []byte) {
 	if d.Decode(&currentTerm) != nil || d.Decode(&votedFor) != nil || d.Decode(&Log) != nil ||
 		d.Decode(&lastIncludedIndex) != nil || d.Decode(&lastIncludedTerm) != nil || d.Decode(&firstIndex) != nil {
 		PrettyDebug(dPersist, "S%d Persist error", rf.me)
-		rf.mu.Unlock()
+		return
 	} else {
 		rf.mu.Lock()
 		rf.currentTerm = currentTerm
@@ -472,16 +481,19 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (2D).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	if index <= rf.lastIncludedIndex {
+		return
+	}
 	// Raft should now trim its log as much as possible.
 	realIndex := len(rf.Log)
 	for i := 0; i < len(rf.Log); i++ {
-		if rf.Log[i].Index == index {
+		if i+rf.firstIndex == index {
 			realIndex = i
 			break
 		}
 	}
-	rf.lastIncludedIndex = index + rf.firstIndex
-	rf.lastIncludedTerm = rf.Log[index].Term
+	rf.lastIncludedIndex = index
+	rf.lastIncludedTerm = rf.Log[realIndex].Term
 	rf.firstIndex = rf.lastIncludedIndex
 
 	logHead := make([]LogEntry, 1)
@@ -620,7 +632,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.XTerm = -1
 		reply.XIndex = lastLogIndex + 1
 		reply.LogInconsistency = true
-		PrettyDebug(dLog2, "S%d mismatch at prevLogIndex %d, FirstLogIndex: %d, LastLogIndex: %d, set XIndex = %d",
+		PrettyDebug(dError, "S%d mismatch at prevLogIndex %d > lastLogIndex, FirstLogIndex: %d, LastLogIndex: %d, set XIndex = %d",
 			rf.me, args.PrevLogIndex, firstLogIndex, lastLogIndex, reply.XIndex)
 		return
 	}
@@ -631,7 +643,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.XTerm = -1
 		reply.XIndex = firstLogIndex + 1
 		reply.LogInconsistency = true
-		PrettyDebug(dLog2, "S%d mismatch at prevLogIndex %d, FirstLogIndex: %d, LastLogIndex: %d, set XIndex = %d",
+		PrettyDebug(dError, "S%d mismatch at prevLogIndex %d, < firstLogIndex, FirstLogIndex: %d, LastLogIndex: %d, set XIndex = %d",
 			rf.me, args.PrevLogIndex, firstLogIndex, lastLogIndex, reply.XIndex)
 		return
 	}
@@ -783,13 +795,13 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	// Trim log
 	index := len(rf.Log)
 	for i := len(rf.Log) - 1; i >= 0; i-- {
-		if (rf.Log[i].Term == args.LastIncludedTerm) && (rf.Log[i].Index == args.LastIncludedIndex) {
+		if (rf.Log[i].Term == args.LastIncludedTerm) && (i+rf.firstIndex == args.LastIncludedIndex) {
 			index = i + 1
 			break
 		}
 	}
 	newLog := make([]LogEntry, 1)
-	newLogTail := make([]LogEntry, 0)
+	newLogTail := make([]LogEntry, len(rf.Log[index:]))
 	copy(newLogTail, rf.Log[index:])
 	rf.Log = append(newLog, newLogTail...)
 
@@ -829,10 +841,16 @@ func (rf *Raft) leaderAppendEntries() {
 		}
 		go func(index int) {
 			// Set args
+
 			rf.mu.Lock()
+			// output a string of raft
+			stateString := fmt.Sprintf("Raft{State: %d,  CurrentTerm: %d, VotedFor: %d, CommitIndex: %d, LastApplied: %d, GetVotesNum: %d, NextIndex: %v, MatchIndex: %v, FirstIndex: %v, LastIncludedIndex: %v, LastIncludedTerm: %v, Log: %s}",
+				rf.state, rf.currentTerm, rf.votedFor, rf.commitIndex, rf.lastApplied, rf.getVotesNum, rf.nextIndex, rf.matchIndex, rf.firstIndex, rf.lastIncludedIndex, rf.lastIncludedTerm, getLogString(rf.Log))
+			PrettyDebug(dSnap, "S%d state %s", rf.me, stateString)
+
 			PrevLogIndex := rf.nextIndex[index] - 1
 			if PrevLogIndex < rf.lastIncludedIndex {
-				sendInstallSnapshot := &InstallSnapshotArgs{
+				InstallSnapshotArgs := &InstallSnapshotArgs{
 					Term:              rf.currentTerm,
 					LeaderId:          rf.me,
 					LastIncludedIndex: rf.lastIncludedIndex,
@@ -841,11 +859,44 @@ func (rf *Raft) leaderAppendEntries() {
 				}
 				reply := &InstallSnapshotReply{}
 				rf.mu.Unlock()
-				rf.sendInstallSnapshot(index, sendInstallSnapshot, reply)
+				ok := false
+				retry := 0
+				for !ok && retry < 3 {
+					ok = rf.sendInstallSnapshot(index, InstallSnapshotArgs, reply)
+					retry++
+					if !ok {
+						time.Sleep(100 * time.Millisecond)
+					}
+				}
 				rf.mu.Lock()
 				// send InstallSnapShot RPC
 				// need to set nextIndex and matchIndex
-				PrettyDebug(dSnap, "send installSnapShot RPC here")
+				PrettyDebug(dSnap, "S%d send installSnapShot RPC to S%d %s", rf.me, index, InstallSnapshotArgs.String())
+				stateString := fmt.Sprintf("Raft{State: %d,  CurrentTerm: %d, VotedFor: %d, CommitIndex: %d, LastApplied: %d, GetVotesNum: %d, NextIndex: %v, MatchIndex: %v, FirstIndex: %v, LastIncludedIndex: %v, LastIncludedTerm: %v, Log: %s}",
+					rf.state, rf.currentTerm, rf.votedFor, rf.commitIndex, rf.lastApplied, rf.getVotesNum, rf.nextIndex, rf.matchIndex, rf.firstIndex, rf.lastIncludedIndex, rf.lastIncludedTerm, getLogString(rf.Log))
+				PrettyDebug(dSnap, "S%d state %s", rf.me, stateString)
+				if reply.Term > rf.currentTerm {
+					rf.FollowerState(reply.Term)
+					rf.mu.Unlock()
+					return
+				}
+				if rf.state != LEADER || !ok {
+					rf.mu.Unlock()
+					return
+				}
+				if reply.Term == rf.currentTerm {
+					if rf.matchIndex[index] < InstallSnapshotArgs.LastIncludedIndex {
+						rf.matchIndex[index] = InstallSnapshotArgs.LastIncludedIndex
+						rf.nextIndex[index] = rf.matchIndex[index] + 1
+					}
+				}
+				rf.commitIndex = rf.countReplica()
+				PrettyDebug(dLog, "S%d finished send installSnapShot, couting replica is %d", rf.me, rf.commitIndex)
+				PrettyDebug(dSnap, "S%d finished installSnapShot RPC to S%d %s", rf.me, index, InstallSnapshotArgs.String())
+				stateString = fmt.Sprintf("Raft{State: %d,  CurrentTerm: %d, VotedFor: %d, CommitIndex: %d, LastApplied: %d, GetVotesNum: %d, NextIndex: %v, MatchIndex: %v, FirstIndex: %v, LastIncludedIndex: %v, LastIncludedTerm: %v, Log: %s}",
+					rf.state, rf.currentTerm, rf.votedFor, rf.commitIndex, rf.lastApplied, rf.getVotesNum, rf.nextIndex, rf.matchIndex, rf.firstIndex, rf.lastIncludedIndex, rf.lastIncludedTerm, getLogString(rf.Log))
+				PrettyDebug(dSnap, "S%d state %s", rf.me, stateString)
+				rf.mu.Unlock()
 				return // return here
 			}
 			args := &AppendEntriesArgs{
@@ -941,8 +992,10 @@ func (rf *Raft) leaderAppendEntries() {
 			// set commitIndex = N (§5.3, §5.4).
 
 			rf.commitIndex = rf.countReplica()
-			//PrettyDebug(dLog, "S%d finished send AppendEntries: %s", rf.me, rf.String())
-
+			PrettyDebug(dLog, "S%d finished send AppendEntries, couting replica is %d", rf.me, rf.commitIndex)
+			stateString = fmt.Sprintf("Raft{State: %d,  CurrentTerm: %d, VotedFor: %d, CommitIndex: %d, LastApplied: %d, GetVotesNum: %d, NextIndex: %v, MatchIndex: %v, FirstIndex: %v, LastIncludedIndex: %v, LastIncludedTerm: %v, Log: %s}",
+				rf.state, rf.currentTerm, rf.votedFor, rf.commitIndex, rf.lastApplied, rf.getVotesNum, rf.nextIndex, rf.matchIndex, rf.firstIndex, rf.lastIncludedIndex, rf.lastIncludedTerm, getLogString(rf.Log))
+			PrettyDebug(dSnap, "S%d state %s", rf.me, stateString)
 			rf.mu.Unlock()
 			// term >= currentTerm
 			// If RPC request or response contains term T > currentTerm:
@@ -1072,7 +1125,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	if !isLeader {
 		return -1, -1, false
 	}
-	entry := LogEntry{Term: term, Command: command, Index: len(rf.Log)} // Index is the index of the log entry in the log
+	entry := LogEntry{Term: term, Command: command, Index: rf.firstIndex + len(rf.Log)} // Index is the index of the log entry in the log
 	rf.Log = append(rf.Log, entry)
 
 	rf.persist()
@@ -1209,7 +1262,7 @@ func (rf *Raft) applyChecker() {
 			// If commitIndex > lastApplied: increment lastApplied, apply log[lastApplied] to state machine (§5.3)
 			if commmitIndex > rf.lastApplied {
 				for (rf.lastApplied < commmitIndex) && (rf.lastApplied < LastLogIndex) {
-					PrettyDebug(dLog, "S%d Apply Entries at %d, commitIndex is %d, Log is %s ", rf.me, rf.lastApplied, rf.commitIndex, getLogString(rf.Log))
+					PrettyDebug(dLog, "S%d Apply Entries at %d, commitIndex is %d, Log is %s ", rf.me, rf.lastApplied+1, rf.commitIndex, getLogString(rf.Log))
 					rf.lastApplied++
 					applyMsg := ApplyMsg{
 						CommandValid: true,
