@@ -776,7 +776,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	}
 
 	upToDate := args.LastIncludedTerm > rf.lastIncludedTerm ||
-		(args.LastIncludedTerm == rf.lastIncludedTerm && args.LastIncludedIndex >= rf.lastIncludedIndex)
+		(args.LastIncludedTerm == rf.lastIncludedTerm && args.LastIncludedIndex > rf.lastIncludedIndex)
 	if !upToDate {
 		reply.Term = rf.currentTerm
 		rf.mu.Unlock()
@@ -899,7 +899,7 @@ func (rf *Raft) leaderAppendEntries() {
 					return
 				}
 				if reply.Term == rf.currentTerm {
-					if rf.matchIndex[index] < InstallSnapshotArgs.LastIncludedIndex {
+					if rf.matchIndex[index] <= InstallSnapshotArgs.LastIncludedIndex {
 						rf.matchIndex[index] = InstallSnapshotArgs.LastIncludedIndex
 						rf.nextIndex[index] = rf.matchIndex[index] + 1
 					}
