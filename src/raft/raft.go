@@ -776,12 +776,14 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	}
 
 	upToDate := args.LastIncludedTerm > rf.lastIncludedTerm ||
-		(args.LastIncludedTerm == rf.lastIncludedTerm && args.LastIncludedIndex > rf.lastIncludedIndex)
+		(args.LastIncludedTerm == rf.lastIncludedTerm && args.LastIncludedIndex >= rf.lastIncludedIndex)
 	if !upToDate {
 		reply.Term = rf.currentTerm
 		rf.mu.Unlock()
 		return
 	}
+	// reset timer
+	rf.lastTimeHeared = time.Now()
 
 	snapShopCopy := make([]byte, len(args.Data))
 	copy(snapShopCopy, args.Data)
@@ -858,29 +860,41 @@ func (rf *Raft) leaderAppendEntries() {
 					Data:              rf.persister.ReadSnapshot(),
 				}
 				reply := &InstallSnapshotReply{}
-				rf.mu.Unlock()
+
 				ok := false
 				retry := 0
-				for !ok && retry < 3 {
-					ok = rf.sendInstallSnapshot(index, InstallSnapshotArgs, reply)
+				for !ok && retry < 3 && !rf.killed() && rf.state == LEADER && rf.currentTerm == InstallSnapshotArgs.Term {
 					retry++
+					rf.mu.Unlock()
+					ok = rf.sendInstallSnapshot(index, InstallSnapshotArgs, reply)
+					rf.mu.Lock()
+					if reply.Term > rf.currentTerm {
+						rf.FollowerState(reply.Term)
+						rf.mu.Unlock()
+						return
+					}
+					if rf.state != LEADER {
+						rf.mu.Unlock()
+						return
+					}
 					if !ok {
-						time.Sleep(100 * time.Millisecond)
+						time.Sleep(200 * time.Millisecond)
 					}
 				}
-				rf.mu.Lock()
 				// send InstallSnapShot RPC
 				// need to set nextIndex and matchIndex
 				PrettyDebug(dSnap, "S%d send installSnapShot RPC to S%d %s", rf.me, index, InstallSnapshotArgs.String())
 				stateString := fmt.Sprintf("Raft{State: %d,  CurrentTerm: %d, VotedFor: %d, CommitIndex: %d, LastApplied: %d, GetVotesNum: %d, NextIndex: %v, MatchIndex: %v, FirstIndex: %v, LastIncludedIndex: %v, LastIncludedTerm: %v, Log: %s}",
 					rf.state, rf.currentTerm, rf.votedFor, rf.commitIndex, rf.lastApplied, rf.getVotesNum, rf.nextIndex, rf.matchIndex, rf.firstIndex, rf.lastIncludedIndex, rf.lastIncludedTerm, getLogString(rf.Log))
 				PrettyDebug(dSnap, "S%d state %s", rf.me, stateString)
-				if reply.Term > rf.currentTerm {
-					rf.FollowerState(reply.Term)
-					rf.mu.Unlock()
-					return
-				}
-				if rf.state != LEADER || !ok {
+				/*
+					if reply.Term > rf.currentTerm {
+						rf.FollowerState(reply.Term)
+						rf.mu.Unlock()
+						return
+					}
+				*/
+				if !ok {
 					rf.mu.Unlock()
 					return
 				}
@@ -927,23 +941,7 @@ func (rf *Raft) leaderAppendEntries() {
 			rf.matchIndex[rf.me] = rf.getLastLogIndex()
 
 			reply := &AppendEntriesReply{}
-			/*
-				sendAppendSuccess := false
-				for !rf.killed() && !sendAppendSuccess && rf.state == LEADER && rf.currentTerm == args.Term {
-					if rf.state != LEADER || rf.currentTerm != args.Term {
-						rf.mu.Unlock()
-						return
-					}
-					rf.mu.Unlock()
-					ok := rf.sendAppendEntries(index, args, reply)
-					sendAppendSuccess = ok
-					if !ok {
-						PrettyDebug(dLog2, "S%d send AppendEntries error", args.LeaderId)
-						time.Sleep(2e8)
-					}
-					rf.mu.Lock()
-				}
-			*/
+
 			PrettyDebug(dLog, "S%d send AppendEntries success", args.LeaderId)
 
 			if rf.state != LEADER || rf.currentTerm != args.Term {
@@ -960,13 +958,13 @@ func (rf *Raft) leaderAppendEntries() {
 
 			// If RPC request or response contains term T > currentTerm: set currentTerm = T, convert to follower
 
-			if reply.Term > rf.currentTerm {
+			if ok && reply.Term > rf.currentTerm {
 				rf.FollowerState(reply.Term)
 				rf.mu.Unlock()
 				return
 			}
 
-			if rf.state != LEADER || rf.currentTerm != args.Term {
+			if ok && (rf.state != LEADER || rf.currentTerm != args.Term) {
 				rf.mu.Unlock()
 				return
 			}
@@ -990,8 +988,10 @@ func (rf *Raft) leaderAppendEntries() {
 			// If there exists an N such that
 			// N > commitIndex, a majority of matchIndex[i] ≥ N, and log[N].term == currentTerm:
 			// set commitIndex = N (§5.3, §5.4).
+			if ok {
+				rf.commitIndex = rf.countReplica()
+			}
 
-			rf.commitIndex = rf.countReplica()
 			PrettyDebug(dLog, "S%d finished send AppendEntries, couting replica is %d", rf.me, rf.commitIndex)
 			stateString = fmt.Sprintf("Raft{State: %d,  CurrentTerm: %d, VotedFor: %d, CommitIndex: %d, LastApplied: %d, GetVotesNum: %d, NextIndex: %v, MatchIndex: %v, FirstIndex: %v, LastIncludedIndex: %v, LastIncludedTerm: %v, Log: %s}",
 				rf.state, rf.currentTerm, rf.votedFor, rf.commitIndex, rf.lastApplied, rf.getVotesNum, rf.nextIndex, rf.matchIndex, rf.firstIndex, rf.lastIncludedIndex, rf.lastIncludedTerm, getLogString(rf.Log))
@@ -1053,30 +1053,34 @@ func (rf *Raft) candidateRequestVote() {
 			requestSuccess := false
 			for !rf.killed() && !requestSuccess && rf.state == CANDIDATE && rf.currentTerm == args.Term {
 				rf.mu.Unlock()
-				ok := rf.sendRequestVote(index, args, reply)
-				requestSuccess = ok
+				requestSuccess = rf.sendRequestVote(index, args, reply)
 				if !requestSuccess {
 					PrettyDebug(dVote, "S%d RequestVote error", args.CandidateId)
 					time.Sleep(2e8)
 				}
 				rf.mu.Lock()
+				if reply.Term > rf.currentTerm {
+					rf.FollowerState(reply.Term)
+					rf.mu.Unlock()
+					return
+				}
 			}
 
 			// If RPC request or response contains termT > currentTerm: set currentTerm = T, convert to follower
-			if reply.Term > rf.currentTerm {
+			if requestSuccess && (reply.Term > rf.currentTerm) {
 				rf.FollowerState(reply.Term)
 				rf.mu.Unlock()
 				return
 			}
 
-			if rf.state != CANDIDATE || rf.currentTerm != args.Term {
+			if requestSuccess && (rf.state != CANDIDATE || rf.currentTerm != args.Term) {
 				rf.mu.Unlock()
 				return
 			}
 
 			// PrettyDebug(dVote, "S%d currentTerm is %d, receiveTerm is %d", rf.me, rf.currentTerm, reply.Term)
 
-			if reply.Term == rf.currentTerm && rf.state == CANDIDATE {
+			if requestSuccess && reply.Term == rf.currentTerm && rf.state == CANDIDATE {
 				if reply.VoteGranted {
 					rf.getVotesNum += 1
 					if rf.getVotesNum > len(rf.peers)/2 {
@@ -1158,7 +1162,7 @@ func (rf *Raft) heartBeat() {
 	// Heatbeat time out
 	HeartbeatTimeout := make(chan bool)
 	go func() {
-		for {
+		for rf.killed() == false {
 			time.Sleep(5e7)
 			HeartbeatTimeout <- true
 		}
@@ -1195,7 +1199,7 @@ func (rf *Raft) ticker() {
 	rf.mu.Unlock()
 	PeriodicTimeout := make(chan bool)
 	go func() {
-		for {
+		for rf.killed() == false {
 			time.Sleep(3e7)
 			PeriodicTimeout <- true
 		}
@@ -1248,7 +1252,7 @@ func (rf *Raft) applyChecker() {
 	// Heatbeat time out
 	ApplyTimeout := make(chan bool)
 	go func() {
-		for {
+		for rf.killed() == false {
 			//time.Sleep(1e8)
 			time.Sleep(2e7)
 			ApplyTimeout <- true
