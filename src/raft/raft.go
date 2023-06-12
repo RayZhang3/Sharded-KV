@@ -125,11 +125,7 @@ func (rf *Raft) getLastLogIndex() int {
 		PrettyDebug(dError, "S %dlog length is 0", rf.me)
 		return 0
 	case 1:
-		if rf.lastIncludedIndex == -1 && rf.lastIncludedTerm == -1 {
-			return 0
-		} else {
-			return rf.lastIncludedIndex
-		}
+		return rf.lastIncludedIndex
 	default:
 		return (len(rf.Log) - 1) + rf.firstIndex
 	}
@@ -142,21 +138,20 @@ func (rf *Raft) getLastLogTerm() int {
 		PrettyDebug(dError, "S %dlog length is 0", rf.me)
 		return 0
 	case 1:
-		if rf.lastIncludedIndex == -1 && rf.lastIncludedTerm == -1 {
-			return 0
-		} else {
-			return rf.lastIncludedTerm
-		}
+		return rf.lastIncludedTerm
 	default:
 		return rf.Log[len(rf.Log)-1].Term
 	}
 }
 
-func (rf *Raft) getLogAt(realIndex int) (bool, *LogEntry) {
+// exist, index, term
+func (rf *Raft) getLogAt(realIndex int) (bool, int, int) {
 	if realIndex >= len(rf.Log) {
-		return false, nil
+		return false, -1, -1
+	} else if realIndex == 0 {
+		return true, rf.lastIncludedIndex, rf.lastIncludedTerm
 	} else {
-		return true, &rf.Log[realIndex]
+		return true, rf.Log[realIndex].Index, rf.Log[realIndex].Term
 	}
 }
 
@@ -194,21 +189,18 @@ func (rf *Raft) countReplica() int {
 	//first := rf.getSameTermFirst(rf.getLastLogIndex())
 	// not Log in this term.
 	if rf.getLastLogTerm() != rf.currentTerm {
-		if rf.lastIncludedIndex == -1 && rf.lastIncludedTerm == -1 {
-			return 0
+		if rf.lastIncludedIndex >= rf.commitIndex {
+			return rf.lastIncludedIndex
 		} else {
-			if rf.lastIncludedIndex >= rf.commitIndex {
-				return rf.lastIncludedIndex
-			} else {
-				return rf.commitIndex
-			}
+			return rf.commitIndex
 		}
 	}
 
 	realIndexStart := len(rf.Log) - 1
 	for i := 0; i < len(rf.Log); i++ {
-		if rf.Log[i].Term == rf.currentTerm {
-			realIndexStart = i
+		_, index, term := rf.getLogAt(i)
+		if term == rf.currentTerm {
+			realIndexStart = index - rf.firstIndex
 			break
 		}
 	}
@@ -487,7 +479,8 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Raft should now trim its log as much as possible.
 	realIndex := len(rf.Log)
 	for i := 0; i < len(rf.Log); i++ {
-		if i+rf.firstIndex == index {
+		_, entryIndex, _ := rf.getLogAt(i)
+		if entryIndex == index {
 			realIndex = i
 			break
 		}
@@ -651,17 +644,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// realIndex >= 0
 	realIndex := args.PrevLogIndex - rf.firstIndex
 
-	contains, prevEntry := rf.getLogAt(realIndex)
+	contains, prevIndex, prevTerm := rf.getLogAt(realIndex)
 
-	// add this for bug, fail 1/60 test case
-	// if realIndex == 0 && rf.lastIncludedIndex > 0, change, but fail
-	if realIndex == 0 && args.PrevLogTerm != rf.Log[0].Term {
-		if args.PrevLogTerm == rf.lastIncludedTerm {
-			contains = true
-		}
-	}
-
-	if !contains || prevEntry.Term != args.PrevLogTerm {
+	if !contains || prevTerm != args.PrevLogTerm {
 		reply.Term = rf.currentTerm
 		reply.Success = false
 		reply.LogInconsistency = true
@@ -670,11 +655,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			reply.XTerm = -1
 			reply.XIndex = lastLogIndex + 1
 		} else {
-			reply.XTerm = prevEntry.Term
+			reply.XTerm = prevTerm
 			reply.XIndex = rf.getSameTermFirst(realIndex) + rf.firstIndex
 		}
-		PrettyDebug(dLog2, "S%d mismatch at prevLogIndex %d, current log length %d",
-			rf.me, args.PrevLogIndex, len(rf.Log))
+		PrettyDebug(dLog2, "S%d reveice APE PrevLogIndex %d, PrevLogTerm %d, mismatch at prevIndex %d, prevLogTerm %d, current log length %d, Log: %s",
+			rf.me, args.PrevLogIndex, args.PrevLogTerm, prevIndex, prevTerm, len(rf.Log), getLogString(rf.Log))
 		return
 	}
 
@@ -817,22 +802,24 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	// 7. Discard the entire log
 
 	// Trim log
-	index := len(rf.Log)
+	trimIndex := len(rf.Log)
 	for i := len(rf.Log) - 1; i >= 0; i-- {
-		if (rf.Log[i].Term == args.LastIncludedTerm) && (i+rf.firstIndex == args.LastIncludedIndex) {
-			index = i + 1
+		_, entryIndex, entryTerm := rf.getLogAt(i)
+		if (entryTerm == args.LastIncludedTerm) && (entryIndex == args.LastIncludedIndex) {
+			trimIndex = i + 1
 			break
 		}
 	}
 	newLog := make([]LogEntry, 1)
-	newLogTail := make([]LogEntry, len(rf.Log[index:]))
-	copy(newLogTail, rf.Log[index:])
+	newLogTail := make([]LogEntry, len(rf.Log[trimIndex:]))
+	copy(newLogTail, rf.Log[trimIndex:])
 	rf.Log = append(newLog, newLogTail...)
 
 	rf.lastIncludedIndex = args.LastIncludedIndex
 	rf.lastIncludedTerm = args.LastIncludedTerm
 
 	rf.firstIndex = rf.lastIncludedIndex
+
 	if rf.commitIndex < rf.lastIncludedIndex {
 		rf.commitIndex = rf.lastIncludedIndex
 	}
@@ -939,11 +926,20 @@ func (rf *Raft) leaderAppendEntries() {
 				Term:         rf.currentTerm,
 				LeaderId:     rf.me,
 				PrevLogIndex: rf.nextIndex[index] - 1,
-				PrevLogTerm:  rf.Log[rf.getRealLogIndex(rf.nextIndex[index]-1)].Term,
+				//PrevLogTerm:  rf.Log[rf.getRealLogIndex(rf.nextIndex[index]-1)].Term,
 				Entries:      nil,
 				LeaderCommit: rf.commitIndex,
 			}
 
+			_, _, entryTerm := rf.getLogAt(rf.getRealLogIndex(args.PrevLogIndex))
+			args.PrevLogTerm = entryTerm
+
+			if args.PrevLogIndex == 0 && rf.lastIncludedIndex < 0 && rf.lastIncludedTerm < 0 {
+				args.PrevLogTerm = 0
+				// exist snapshot
+			} else if args.PrevLogIndex == 0 && rf.lastIncludedIndex > 0 && rf.lastIncludedTerm > 0 {
+				args.PrevLogTerm = rf.lastIncludedTerm
+			}
 			//
 			// args.PrevLogTerm = rf.Log[args.PrevLogIndex].Term
 			// If last log index ≥ nextIndex for a follower:
@@ -1042,8 +1038,9 @@ func (rf *Raft) handleLogInconsistency(index int, reply *AppendEntriesReply) {
 	} else {
 		target := reply.XIndex
 		for i := len(rf.Log) - 1; i > 0; i-- {
-			if rf.Log[i].Term == reply.XTerm {
-				target = (i + rf.firstIndex) + 1
+			_, entryIndex, entryTerm := rf.getLogAt(i)
+			if entryTerm == reply.XTerm {
+				target = entryIndex + 1
 				break
 			}
 		}
@@ -1379,8 +1376,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// End
 
 	// Lab 2D
-	rf.lastIncludedIndex = -1
-	rf.lastIncludedTerm = -1
+	rf.lastIncludedIndex = 0
+	rf.lastIncludedTerm = 0
 	rf.snapShot = nil
 	rf.firstIndex = 0
 	// initialize from state persisted before a crash
