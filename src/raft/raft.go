@@ -648,9 +648,19 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 
+	// realIndex >= 0
 	realIndex := args.PrevLogIndex - rf.firstIndex
 
 	contains, prevEntry := rf.getLogAt(realIndex)
+
+	// add this for bug, fail 1/60 test case
+	// if realIndex == 0 && rf.lastIncludedIndex > 0, change, but fail
+	if realIndex == 0 && args.PrevLogTerm != rf.Log[0].Term {
+		if args.PrevLogTerm == rf.lastIncludedTerm {
+			contains = true
+		}
+	}
+
 	if !contains || prevEntry.Term != args.PrevLogTerm {
 		reply.Term = rf.currentTerm
 		reply.Success = false
@@ -775,15 +785,27 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 		rf.FollowerState(args.Term)
 	}
 
-	upToDate := args.LastIncludedTerm > rf.lastIncludedTerm ||
-		(args.LastIncludedTerm == rf.lastIncludedTerm && args.LastIncludedIndex > rf.lastIncludedIndex)
+	/*
+		upToDate := args.LastIncludedTerm > rf.lastIncludedTerm ||
+			(args.LastIncludedTerm == rf.lastIncludedTerm && args.LastIncludedIndex > rf.lastIncludedIndex)
+		if !upToDate {
+			reply.Term = rf.currentTerm
+			rf.mu.Unlock()
+			return
+		}
+	*/
+
+	// reset timer
+	rf.lastTimeHeared = time.Now()
+
+	upToDate := args.LastIncludedIndex > rf.lastIncludedIndex
 	if !upToDate {
 		reply.Term = rf.currentTerm
 		rf.mu.Unlock()
 		return
 	}
-	// reset timer
-	rf.lastTimeHeared = time.Now()
+	//
+	//
 
 	snapShopCopy := make([]byte, len(args.Data))
 	copy(snapShopCopy, args.Data)
