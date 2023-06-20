@@ -112,13 +112,6 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 			PrettyDebug(dClient, "Client %d Send PUTAPPEND to Server %d successfully", ck.clientID, leaderID)
 			ck.leaderID = leaderID
 			return
-
-		case "ErrWrongLeader":
-			if putAppendReply.LeaderHint != -1 {
-				ck.leaderID = putAppendReply.LeaderHint
-			} else {
-				ck.leaderID = ck.getRandServer()
-			}
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
