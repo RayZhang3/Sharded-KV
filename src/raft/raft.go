@@ -611,7 +611,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// Reply false if log doesn’t contain an entry at prevLogIndex whose term matches prevLogTerm
 
 	// Lab3 update current leader
-	rf.currentLeader = args.CurrentLeader
+	rf.currentLeader = args.LeaderId
 
 	firstLogIndex := rf.lastIncludedIndex
 	lastLogIndex := rf.getLastLogIndex()
@@ -783,7 +783,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 		return
 	}
 	// Lab3 update current leader
-	rf.currentLeader = args.CurrentLeader
+	rf.currentLeader = args.LeaderId
 
 	snapShopCopy := make([]byte, len(args.Data))
 	copy(snapShopCopy, args.Data)

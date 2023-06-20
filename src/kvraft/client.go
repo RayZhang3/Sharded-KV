@@ -3,7 +3,6 @@ package kvraft
 import (
 	"crypto/rand"
 	"math/big"
-	"time"
 
 	"6.824/labrpc"
 )
@@ -53,14 +52,8 @@ func (ck *Clerk) Get(key string) string {
 	var ok bool
 	var leaderID int
 	for !ok || getReply.Err != "ok" {
-
-		if getReply.Err == "ErrWrongLeader" {
-			leaderID = -1
-		} else {
-			leaderID = ck.leaderID
-		}
-
-		if leaderID == -1 {
+		leaderID = ck.leaderID
+		if getReply.Err == "ErrWrongLeader" || leaderID == -1 {
 			leaderID = ck.getRandServer()
 		}
 		ok = ck.servers[leaderID].Call("KVServer.Get", &getArgs, &getReply)
@@ -73,12 +66,14 @@ func (ck *Clerk) Get(key string) string {
 		switch getReply.Err {
 		case "OK":
 			ck.seqNum++
+			ck.leaderID = leaderID
 			PrettyDebug(dClient, "Client %d Send GET to Server %d successfully", ck.clientID, leaderID)
 			return getReply.Value
 		case "ErrNoKey":
+			ck.leaderID = leaderID
 			return ""
 		}
-		time.Sleep(100 * time.Millisecond)
+		// time.Sleep(100 * time.Millisecond)
 	}
 	return ""
 }
@@ -100,14 +95,8 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 	var ok bool
 	var leaderID int
 	for !ok || putAppendReply.Err != "ok" {
-
-		if putAppendReply.Err == "ErrWrongLeader" {
-			leaderID = -1
-		} else {
-			leaderID = ck.leaderID
-		}
-
-		if leaderID == -1 {
+		leaderID = ck.leaderID
+		if putAppendReply.Err == "ErrWrongLeader" || leaderID == -1 {
 			leaderID = ck.getRandServer()
 		}
 		ok = ck.servers[leaderID].Call("KVServer.PutAppend", &putAppendArgs, &putAppendReply)
@@ -120,6 +109,7 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 		switch putAppendReply.Err {
 		case "OK":
 			PrettyDebug(dClient, "Cliend %d Send PUTAPPEND to Server %d successfully", ck.clientID, leaderID)
+			ck.leaderID = leaderID
 			ck.seqNum++
 			return
 		case "ErrWrongLeader":
@@ -129,7 +119,7 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 				ck.leaderID = ck.getRandServer()
 			}
 		}
-		time.Sleep(100 * time.Millisecond)
+		// time.Sleep(100 * time.Millisecond)
 	}
 }
 

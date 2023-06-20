@@ -57,6 +57,9 @@ func (kv *KVServer) String() {
 
 func (kv *KVServer) applyHandler() {
 	for applyMsg := range kv.applyCh {
+		if kv.killed() {
+			break
+		}
 		if applyMsg.CommandValid == false {
 			PrettyDebug(dServer, "Server%d get invalid command", kv.me)
 			continue
@@ -72,6 +75,12 @@ func (kv *KVServer) applyHandler() {
 			kv.mu.Lock()
 			_, isLeader := kv.rf.GetState()
 			// Reply SESSION_EXPIRED if no record of clientID or if response for client's sequenceNum already discarded
+
+			// check if the client session is existing, if not, init one with -1
+			_, isPresent := kv.clientSeq[appliedOp.ClientID]
+			if !isPresent {
+				kv.clientSeq[appliedOp.ClientID] = -1
+			}
 			if kv.clientSeq[appliedOp.ClientID]+1 < appliedOp.SeqNum {
 				PrettyDebug(dError, "Server%d Error applyMsg, session is not exist, appliedOp: %s, kv.clientSeq: %v",
 					kv.me, appliedOp.String(), kv.clientSeq)
@@ -80,19 +89,24 @@ func (kv *KVServer) applyHandler() {
 			}
 			commandIndex := applyMsg.CommandIndex
 			// If sequenceNum already processed from client, reply OK with stored response
-			if kv.clientSeq[appliedOp.ClientID] >= appliedOp.SeqNum && appliedOp.SeqNum != 0 {
+			// Check duplicated command
+			if kv.clientSeq[appliedOp.ClientID] >= appliedOp.SeqNum {
 				PrettyDebug(dServer, "Server%d sequenceNum already processed from client %d, appliedOp: %s, kv.clientSeq: %v",
 					kv.me, appliedOp.ClientID, appliedOp.String(), kv.clientSeq)
-				_, isPresent := kv.waitChan[commandIndex]
-				if isLeader && isPresent {
-					kv.waitChan[commandIndex] <- appliedOp
-					kv.mu.Unlock()
+				if appliedOp.Optype == "Get" {
+					appliedOp.Value = kv.currentState[appliedOp.Key]
 				}
+
+				_, isPresent := kv.waitChan[commandIndex]
+				if isPresent {
+					kv.waitChan[commandIndex] <- appliedOp
+				}
+				kv.mu.Unlock()
 				continue
 			}
 
 			// update the SeqNum
-			if appliedOp.SeqNum == 0 || kv.clientSeq[appliedOp.ClientID] < appliedOp.SeqNum {
+			if kv.clientSeq[appliedOp.ClientID] < appliedOp.SeqNum {
 				kv.clientSeq[appliedOp.ClientID] = appliedOp.SeqNum
 			}
 			// apply the command to state machine
@@ -108,8 +122,8 @@ func (kv *KVServer) applyHandler() {
 			}
 			PrettyDebug(dServer, "Server%d apply command %s, kv.currentState:%v", kv.me, appliedOp.String(), kv.currentState)
 			// if the channel is existing, and the leader is still alive, send the appliedOp to the channel
-			_, isPresent := kv.waitChan[commandIndex]
-			if isLeader && isPresent {
+			_, waitChanPresent := kv.waitChan[commandIndex]
+			if isLeader && waitChanPresent {
 				kv.waitChan[commandIndex] <- appliedOp
 			}
 			kv.mu.Unlock()
@@ -161,16 +175,15 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 		waitCh := kv.getWaitCh(index)
 		kv.mu.Unlock()
 		// wait for appliedOp from applyHandler
-		applyTimeout := make(chan bool)
-		go func() {
-			time.Sleep(5e8)
-			applyTimeout <- true
-		}()
+		timer := time.NewTicker(5e8)
+		defer timer.Stop()
+
 		select {
-		case <-applyTimeout:
+		case <-timer.C:
 			kv.mu.Lock()
 			defer kv.mu.Unlock()
 			close(waitCh)
+			kv.waitChan[index] = nil
 			reply.Err = ErrWrongLeader
 			reply.LeaderHint = -1
 			return
@@ -184,8 +197,8 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 			}
 			PrettyDebug(dServer, "Server%d receive GET command from raft, COMMAND %s", kv.me, op.String())
 
-			_, currentTerm, _ := kv.rf.RaftState()
-			if term != currentTerm {
+			isLeader, currentTerm, _ := kv.rf.RaftState()
+			if !isLeader || term != currentTerm {
 				reply.Err = ErrWrongLeader
 				reply.LeaderHint = -1
 				return
@@ -242,18 +255,17 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 
 		// wait for appliedOp from applyHandler
 
-		applyTimeout := make(chan bool)
-		go func() {
-			time.Sleep(5e8)
-			applyTimeout <- true
-		}()
+		timer := time.NewTicker(5e8)
+		defer timer.Stop()
+
 		select {
-		case <-applyTimeout:
+		case <-timer.C:
 			kv.mu.Lock()
 			defer kv.mu.Unlock()
 			reply.Err = ErrWrongLeader
 			reply.LeaderHint = -1
 			close(waitCh)
+			kv.waitChan[index] = nil
 			return
 		case applyOp, ok := <-waitCh:
 			kv.mu.Lock()
