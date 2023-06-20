@@ -68,9 +68,9 @@ func (kv *KVServer) applyHandler() {
 			PrettyDebug(dServer, "Server%d get valid command %s", kv.me, op.String())
 			if !ok {
 				PrettyDebug(dError, "Server%d Error: applyMsg.Command is not of type Op", kv.me)
-				kv.mu.Unlock()
 				continue
 			}
+
 			appliedOp := Op{op.ClientID, op.SeqNum, op.Key, op.Value, op.Optype}
 			kv.mu.Lock()
 			_, isLeader := kv.rf.GetState()
@@ -157,69 +157,69 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 		reply.LeaderHint = leaderHint
 		return
 	}
-	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+
+	kv.mu.Lock()
+	// Append command to log, replicate and commit it
+	op := Op{args.ClientID, args.SeqNum, args.Key, "", "Get"}
+	PrettyDebug(dServer, "Server%d insert GET command to raft, COMMAND %s", kv.me, op.String())
+
+	index, term, isLeader := kv.rf.Start(op)
+	if !isLeader {
+		reply.Err = ErrWrongLeader
+		reply.LeaderHint = -1
+		return
+	}
+	waitCh := kv.getWaitCh(index)
+	kv.mu.Unlock()
+	// wait for appliedOp from applyHandler
+	timer := time.NewTicker(2e8)
+	defer timer.Stop()
+
+	select {
+	case <-timer.C:
 		kv.mu.Lock()
-		// Append command to log, replicate and commit it
-		op := Op{args.ClientID, args.SeqNum, args.Key, "", "Get"}
-		PrettyDebug(dServer, "Server%d insert GET command to raft, COMMAND %s", kv.me, op.String())
-
-		index, term, isLeader := kv.rf.Start(op)
-		if !isLeader {
+		defer kv.mu.Unlock()
+		close(waitCh)
+		delete(kv.waitChan, index)
+		reply.Err = ErrWrongLeader
+		reply.LeaderHint = -1
+		return
+	case applyOp, ok := <-waitCh:
+		kv.mu.Lock()
+		defer kv.mu.Unlock()
+		close(waitCh)
+		delete(kv.waitChan, index)
+		if !ok {
 			reply.Err = ErrWrongLeader
 			reply.LeaderHint = -1
 			return
 		}
-		waitCh := kv.getWaitCh(index)
-		kv.mu.Unlock()
-		// wait for appliedOp from applyHandler
-		timer := time.NewTicker(5e8)
-		defer timer.Stop()
+		PrettyDebug(dServer, "Server%d receive GET command from raft, COMMAND %s", kv.me, op.String())
 
-		select {
-		case <-timer.C:
-			kv.mu.Lock()
-			defer kv.mu.Unlock()
-			close(waitCh)
-			kv.waitChan[index] = nil
+		isLeader, currentTerm, _ := kv.rf.RaftState()
+		if !isLeader || term != currentTerm {
 			reply.Err = ErrWrongLeader
 			reply.LeaderHint = -1
 			return
-		case applyOp, ok := <-waitCh:
-			kv.mu.Lock()
-			defer kv.mu.Unlock()
-			if !ok {
-				reply.Err = ErrWrongLeader
-				reply.LeaderHint = -1
-				return
-			}
-			PrettyDebug(dServer, "Server%d receive GET command from raft, COMMAND %s", kv.me, op.String())
-
-			isLeader, currentTerm, _ := kv.rf.RaftState()
-			if !isLeader || term != currentTerm {
-				reply.Err = ErrWrongLeader
-				reply.LeaderHint = -1
-				return
-			}
-
-			if applyOp.SeqNum == args.SeqNum && applyOp.ClientID == args.ClientID {
-				reply.Value = applyOp.Value
-				reply.Err = OK
-				reply.LeaderHint = kv.me
-				return
-			}
 		}
-		/*
-			isPresent, clientSeq := kv.clientSeq[applyOp.ClientID]
-			if (!isPresent) {
-				fmt.Println("error! client not present in clientSeq map")
-			}
-		*/
-	}()
 
-	wg.Wait()
+		if applyOp.SeqNum == args.SeqNum && applyOp.ClientID == args.ClientID {
+			reply.Value = applyOp.Value
+			reply.Err = OK
+			reply.LeaderHint = kv.me
+			return
+		} else {
+			reply.Err = ErrWrongLeader
+			reply.LeaderHint = -1
+			return
+		}
+	}
+	/*
+		isPresent, clientSeq := kv.clientSeq[applyOp.ClientID]
+		if (!isPresent) {
+			fmt.Println("error! client not present in clientSeq map")
+		}
+	*/
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
@@ -232,67 +232,68 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		reply.LeaderHint = leaderHint
 		return
 	}
-	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		// Append command to log, replicate and commit it
+
+	// Append command to log, replicate and commit it
+	kv.mu.Lock()
+	op := Op{args.ClientID, args.SeqNum, args.Key, args.Value, args.Op}
+	index, term, isLeader := kv.rf.Start(op)
+	if !isLeader {
+		reply.Err = ErrWrongLeader
+		reply.LeaderHint = leaderHint
+		return
+	}
+	waitCh := kv.getWaitCh(index)
+	PrettyDebug(dServer, "Server%d insert PUTAPPEND command to raft, COMMAND %s", kv.me, op.String())
+	kv.mu.Unlock()
+
+	// If sequenceNum already processed from client, reply OK with stored response
+	// Apply command in log order
+	// save state machine output with SeqNum for client, discard any prior response for client (smaller than SeqNum)
+
+	// wait for appliedOp from applyHandler
+
+	timer := time.NewTicker(2e8)
+	defer timer.Stop()
+
+	select {
+	case <-timer.C:
 		kv.mu.Lock()
-		op := Op{args.ClientID, args.SeqNum, args.Key, args.Value, args.Op}
-		index, term, isLeader := kv.rf.Start(op)
-		if !isLeader {
-			reply.Err = ErrWrongLeader
-			reply.LeaderHint = leaderHint
-			return
-		}
-		waitCh := kv.getWaitCh(index)
-		PrettyDebug(dServer, "Server%d insert PUTAPPEND command to raft, COMMAND %s", kv.me, op.String())
-		kv.mu.Unlock()
-
-		// If sequenceNum already processed from client, reply OK with stored response
-		// Apply command in log order
-		// save state machine output with SeqNum for client, discard any prior response for client (smaller than SeqNum)
-
-		// wait for appliedOp from applyHandler
-
-		timer := time.NewTicker(5e8)
-		defer timer.Stop()
-
-		select {
-		case <-timer.C:
-			kv.mu.Lock()
-			defer kv.mu.Unlock()
+		defer kv.mu.Unlock()
+		reply.Err = ErrWrongLeader
+		reply.LeaderHint = -1
+		close(waitCh)
+		delete(kv.waitChan, index)
+		return
+	case applyOp, ok := <-waitCh:
+		kv.mu.Lock()
+		defer kv.mu.Unlock()
+		close(waitCh)
+		delete(kv.waitChan, index)
+		if !ok {
 			reply.Err = ErrWrongLeader
 			reply.LeaderHint = -1
-			close(waitCh)
-			kv.waitChan[index] = nil
 			return
-		case applyOp, ok := <-waitCh:
-			kv.mu.Lock()
-			defer kv.mu.Unlock()
-			//close(waitCh)
-			if !ok {
-				reply.Err = ErrWrongLeader
-				reply.LeaderHint = -1
-				return
-			}
-			PrettyDebug(dServer, "Server%d receive GET command from raft, COMMAND %s", kv.me, op.String())
-
-			_, currentTerm, _ := kv.rf.RaftState()
-			if term != currentTerm {
-				reply.Err = ErrWrongLeader
-				reply.LeaderHint = -1
-				return
-			}
-
-			if applyOp.SeqNum == args.SeqNum && applyOp.ClientID == args.ClientID {
-				reply.Err = OK
-				reply.LeaderHint = kv.me
-				return
-			}
 		}
-	}()
-	wg.Wait()
+		PrettyDebug(dServer, "Server%d receive GET command from raft, COMMAND %s", kv.me, op.String())
+
+		isLeader, currentTerm, _ := kv.rf.RaftState()
+		if !isLeader || term != currentTerm {
+			reply.Err = ErrWrongLeader
+			reply.LeaderHint = -1
+			return
+		}
+
+		if applyOp.SeqNum == args.SeqNum && applyOp.ClientID == args.ClientID {
+			reply.Err = OK
+			reply.LeaderHint = kv.me
+			return
+		} else {
+			reply.Err = ErrWrongLeader
+			reply.LeaderHint = -1
+			return
+		}
+	}
+
 }
 
 //

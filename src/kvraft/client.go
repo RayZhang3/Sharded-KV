@@ -3,6 +3,7 @@ package kvraft
 import (
 	"crypto/rand"
 	"math/big"
+	"time"
 
 	"6.824/labrpc"
 )
@@ -73,7 +74,7 @@ func (ck *Clerk) Get(key string) string {
 			ck.leaderID = leaderID
 			return ""
 		}
-		// time.Sleep(100 * time.Millisecond)
+		time.Sleep(100 * time.Millisecond)
 	}
 	return ""
 }
@@ -119,7 +120,7 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 				ck.leaderID = ck.getRandServer()
 			}
 		}
-		// time.Sleep(100 * time.Millisecond)
+		time.Sleep(100 * time.Millisecond)
 	}
 }
 
@@ -131,8 +132,6 @@ func (ck *Clerk) Append(key string, value string) {
 }
 
 func (ck *Clerk) getRandServer() int {
-	for {
-		newServer := int(nrand()) % len(ck.servers)
-		return newServer
-	}
+	newServer := int(nrand()) % len(ck.servers)
+	return newServer
 }
