@@ -1,13 +1,19 @@
 package kvraft
 
-import "6.824/labrpc"
-import "crypto/rand"
-import "math/big"
+import (
+	"crypto/rand"
+	"math/big"
+	"time"
 
+	"6.824/labrpc"
+)
 
 type Clerk struct {
 	servers []*labrpc.ClientEnd
 	// You will have to modify this struct.
+	clientID int64
+	seqNum   int
+	leaderID int
 }
 
 func nrand() int64 {
@@ -21,6 +27,9 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
 	// You'll have to add code here.
+	ck.clientID = nrand()
+	ck.seqNum = 0
+	ck.leaderID = -1
 	return ck
 }
 
@@ -39,6 +48,38 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 func (ck *Clerk) Get(key string) string {
 
 	// You will have to modify this function.
+	getArgs := GetArgs{key, ck.clientID, ck.seqNum}
+	getReply := GetReply{}
+	var ok bool
+	var leaderID int
+	for !ok || getReply.Err != "ok" {
+
+		if getReply.Err == "ErrWrongLeader" {
+			leaderID = -1
+		} else {
+			leaderID = ck.leaderID
+		}
+
+		if leaderID == -1 {
+			leaderID = ck.getRandServer()
+		}
+		ok = ck.servers[leaderID].Call("KVServer.Get", &getArgs, &getReply)
+		if !ok || getReply.Err == "ErrWrongLeader" {
+			ck.leaderID = ck.getRandServer()
+			continue
+		}
+		PrettyDebug(dClient, "Client %d Send GET to Server %d, GetArgs%s, and receive GetReply%s ", ck.clientID, leaderID, getArgs.String(), getReply.String())
+
+		switch getReply.Err {
+		case "OK":
+			ck.seqNum++
+			PrettyDebug(dClient, "Client %d Send GET to Server %d successfully", ck.clientID, leaderID)
+			return getReply.Value
+		case "ErrNoKey":
+			return ""
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
 	return ""
 }
 
@@ -54,6 +95,42 @@ func (ck *Clerk) Get(key string) string {
 //
 func (ck *Clerk) PutAppend(key string, value string, op string) {
 	// You will have to modify this function.
+	putAppendArgs := PutAppendArgs{key, value, op, ck.clientID, ck.seqNum}
+	putAppendReply := PutAppendReply{}
+	var ok bool
+	var leaderID int
+	for !ok || putAppendReply.Err != "ok" {
+
+		if putAppendReply.Err == "ErrWrongLeader" {
+			leaderID = -1
+		} else {
+			leaderID = ck.leaderID
+		}
+
+		if leaderID == -1 {
+			leaderID = ck.getRandServer()
+		}
+		ok = ck.servers[leaderID].Call("KVServer.PutAppend", &putAppendArgs, &putAppendReply)
+		if !ok {
+			ck.leaderID = ck.getRandServer()
+			continue
+		}
+		PrettyDebug(dClient, "Cliend %d Send PUTAPPEND to Server %d, send args %s and receive %s ", ck.clientID, leaderID, putAppendArgs.String(), putAppendReply.String())
+
+		switch putAppendReply.Err {
+		case "OK":
+			PrettyDebug(dClient, "Cliend %d Send PUTAPPEND to Server %d successfully", ck.clientID, leaderID)
+			ck.seqNum++
+			return
+		case "ErrWrongLeader":
+			if putAppendReply.LeaderHint != -1 {
+				ck.leaderID = putAppendReply.LeaderHint
+			} else {
+				ck.leaderID = ck.getRandServer()
+			}
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
 }
 
 func (ck *Clerk) Put(key string, value string) {
@@ -61,4 +138,11 @@ func (ck *Clerk) Put(key string, value string) {
 }
 func (ck *Clerk) Append(key string, value string) {
 	ck.PutAppend(key, value, "Append")
+}
+
+func (ck *Clerk) getRandServer() int {
+	for {
+		newServer := int(nrand()) % len(ck.servers)
+		return newServer
+	}
 }
