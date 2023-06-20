@@ -73,20 +73,14 @@ func (kv *KVServer) applyHandler() {
 
 			appliedOp := Op{op.ClientID, op.SeqNum, op.Key, op.Value, op.Optype}
 			kv.mu.Lock()
-			_, isLeader := kv.rf.GetState()
 			// Reply SESSION_EXPIRED if no record of clientID or if response for client's sequenceNum already discarded
 
-			// check if the client session is existing, if not, init one with -1
-			_, isPresent := kv.clientSeq[appliedOp.ClientID]
-			if !isPresent {
-				kv.clientSeq[appliedOp.ClientID] = -1
+			// check if the client session is existing, if not, init one with 0
+			_, clientIsPresent := kv.clientSeq[appliedOp.ClientID]
+			if !clientIsPresent {
+				kv.clientSeq[appliedOp.ClientID] = 0
 			}
-			if kv.clientSeq[appliedOp.ClientID]+1 < appliedOp.SeqNum {
-				PrettyDebug(dError, "Server%d Error applyMsg, session is not exist, appliedOp: %s, kv.clientSeq: %v",
-					kv.me, appliedOp.String(), kv.clientSeq)
-				kv.mu.Unlock()
-				continue
-			}
+
 			commandIndex := applyMsg.CommandIndex
 			// If sequenceNum already processed from client, reply OK with stored response
 			// Check duplicated command
@@ -96,37 +90,34 @@ func (kv *KVServer) applyHandler() {
 				if appliedOp.Optype == "Get" {
 					appliedOp.Value = kv.currentState[appliedOp.Key]
 				}
-
 				_, isPresent := kv.waitChan[commandIndex]
 				if isPresent {
 					kv.waitChan[commandIndex] <- appliedOp
 				}
 				kv.mu.Unlock()
 				continue
-			}
-
-			// update the SeqNum
-			if kv.clientSeq[appliedOp.ClientID] < appliedOp.SeqNum {
+			} else {
+				// If sequenceNum not processed, store response and reply OK
+				// update the clientSeq
 				kv.clientSeq[appliedOp.ClientID] = appliedOp.SeqNum
+				// apply the command to state machine
+				switch appliedOp.Optype {
+				case "Get":
+					appliedOp.Value = kv.currentState[appliedOp.Key]
+				case "Put":
+					kv.currentState[appliedOp.Key] = appliedOp.Value
+				case "Append":
+					currValue := kv.currentState[appliedOp.Key]
+					kv.currentState[appliedOp.Key] = currValue + appliedOp.Value
+				}
+				PrettyDebug(dServer, "Server%d apply command %s, kv.currentState:%v", kv.me, appliedOp.String(), kv.currentState)
+				// if the channel is existing, and the leader is still alive, send the appliedOp to the channel
+				_, waitChanPresent := kv.waitChan[commandIndex]
+				if waitChanPresent {
+					kv.waitChan[commandIndex] <- appliedOp
+				}
+				kv.mu.Unlock()
 			}
-			// apply the command to state machine
-
-			switch appliedOp.Optype {
-			case "Get":
-				appliedOp.Value = kv.currentState[appliedOp.Key]
-			case "Put":
-				kv.currentState[appliedOp.Key] = appliedOp.Value
-			case "Append":
-				currValue := kv.currentState[appliedOp.Key]
-				kv.currentState[appliedOp.Key] = currValue + appliedOp.Value
-			}
-			PrettyDebug(dServer, "Server%d apply command %s, kv.currentState:%v", kv.me, appliedOp.String(), kv.currentState)
-			// if the channel is existing, and the leader is still alive, send the appliedOp to the channel
-			_, waitChanPresent := kv.waitChan[commandIndex]
-			if isLeader && waitChanPresent {
-				kv.waitChan[commandIndex] <- appliedOp
-			}
-			kv.mu.Unlock()
 		}
 	}
 }
@@ -147,9 +138,6 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
 
 	isLeader, _, leaderHint := kv.rf.RaftState()
-
-	// use -1 for test
-	// leaderHint = -1
 
 	// Reply NOT_Leader if not leader, providing hint when available
 	if !isLeader {
@@ -184,6 +172,7 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 		reply.Err = ErrWrongLeader
 		reply.LeaderHint = -1
 		return
+
 	case applyOp, ok := <-waitCh:
 		kv.mu.Lock()
 		defer kv.mu.Unlock()

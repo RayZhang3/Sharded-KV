@@ -46,13 +46,13 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 // arguments. and reply must be passed as a pointer.
 //
 func (ck *Clerk) Get(key string) string {
-
+	ck.seqNum++
 	// You will have to modify this function.
 	getArgs := GetArgs{key, ck.clientID, ck.seqNum}
 	getReply := GetReply{}
 	var ok bool
 	var leaderID int
-	for !ok || getReply.Err != "ok" {
+	for {
 		leaderID = ck.leaderID
 		if getReply.Err == "ErrWrongLeader" || leaderID == -1 {
 			leaderID = ck.getRandServer()
@@ -66,7 +66,6 @@ func (ck *Clerk) Get(key string) string {
 
 		switch getReply.Err {
 		case "OK":
-			ck.seqNum++
 			ck.leaderID = leaderID
 			PrettyDebug(dClient, "Client %d Send GET to Server %d successfully", ck.clientID, leaderID)
 			return getReply.Value
@@ -90,29 +89,30 @@ func (ck *Clerk) Get(key string) string {
 // arguments. and reply must be passed as a pointer.
 //
 func (ck *Clerk) PutAppend(key string, value string, op string) {
+	ck.seqNum++
 	// You will have to modify this function.
 	putAppendArgs := PutAppendArgs{key, value, op, ck.clientID, ck.seqNum}
 	putAppendReply := PutAppendReply{}
 	var ok bool
 	var leaderID int
-	for !ok || putAppendReply.Err != "ok" {
+	for {
 		leaderID = ck.leaderID
 		if putAppendReply.Err == "ErrWrongLeader" || leaderID == -1 {
 			leaderID = ck.getRandServer()
 		}
 		ok = ck.servers[leaderID].Call("KVServer.PutAppend", &putAppendArgs, &putAppendReply)
-		if !ok {
+		if !ok || putAppendReply.Err == "ErrWrongLeader" {
 			ck.leaderID = ck.getRandServer()
 			continue
 		}
-		PrettyDebug(dClient, "Cliend %d Send PUTAPPEND to Server %d, send args %s and receive %s ", ck.clientID, leaderID, putAppendArgs.String(), putAppendReply.String())
+		PrettyDebug(dClient, "Client %d Send PUTAPPEND to Server %d, send args %s and receive %s ", ck.clientID, leaderID, putAppendArgs.String(), putAppendReply.String())
 
 		switch putAppendReply.Err {
 		case "OK":
-			PrettyDebug(dClient, "Cliend %d Send PUTAPPEND to Server %d successfully", ck.clientID, leaderID)
+			PrettyDebug(dClient, "Client %d Send PUTAPPEND to Server %d successfully", ck.clientID, leaderID)
 			ck.leaderID = leaderID
-			ck.seqNum++
 			return
+
 		case "ErrWrongLeader":
 			if putAppendReply.LeaderHint != -1 {
 				ck.leaderID = putAppendReply.LeaderHint
