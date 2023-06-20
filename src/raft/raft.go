@@ -56,6 +56,8 @@ type ApplyMsg struct {
 	Snapshot      []byte
 	SnapshotTerm  int
 	SnapshotIndex int
+	// For 3A
+	ApplyTerm int
 }
 
 // state
@@ -827,6 +829,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 		Snapshot:      snapShopCopy,
 		SnapshotTerm:  args.LastIncludedTerm,
 		SnapshotIndex: args.LastIncludedIndex,
+		ApplyTerm:     args.Term,
 	}
 	rf.mu.Unlock()
 	rf.applyCh <- applyMsg
@@ -1267,6 +1270,7 @@ func (rf *Raft) applyChecker() {
 						CommandValid: true,
 						Command:      rf.Log[rf.getRealLogIndex(rf.lastApplied)].Command,
 						CommandIndex: rf.lastApplied,
+						ApplyTerm:    rf.Log[rf.getRealLogIndex(rf.lastApplied)].Term,
 					}
 					rf.mu.Unlock()
 					rf.applyCh <- applyMsg
