@@ -50,18 +50,17 @@ func (ck *Clerk) Get(key string) string {
 	// You will have to modify this function.
 	var ok bool
 	var leaderID int
-	var lastReplyErr Err
+	var lastReplyErrLeader bool
 	getArgs := GetArgs{key, ck.clientID, ck.seqNum}
 	for {
 		getReply := GetReply{}
 		leaderID = ck.leaderID
-		if lastReplyErr == "ErrWrongLeader" || leaderID == -1 {
+		if lastReplyErrLeader || leaderID == -1 {
 			leaderID = ck.getRandServer()
 		}
 		ok = ck.servers[leaderID].Call("KVServer.Get", &getArgs, &getReply)
 		if !ok || getReply.Err == "ErrWrongLeader" {
-			ck.leaderID = ck.getRandServer()
-			lastReplyErr = getReply.Err
+			lastReplyErrLeader = true
 			continue
 		}
 
@@ -71,14 +70,16 @@ func (ck *Clerk) Get(key string) string {
 		case "OK":
 			ck.seqNum++
 			ck.leaderID = leaderID
+			lastReplyErrLeader = false
 			PrettyDebug(dClient, "Client %d Send GET to Server %d successfully", ck.clientID, leaderID)
 			return getReply.Value
 		case "ErrNoKey":
 			ck.seqNum++
 			ck.leaderID = leaderID
+			lastReplyErrLeader = false
 			return ""
 		}
-		time.Sleep(100 * time.Millisecond)
+		time.Sleep(10 * time.Millisecond)
 	}
 	return ""
 }
@@ -98,17 +99,17 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 	// You will have to modify this function.
 	var ok bool
 	var leaderID int
-	var lastReplyErr Err
+	var lastReplyErrLeader bool
 	putAppendArgs := PutAppendArgs{key, value, op, ck.clientID, ck.seqNum}
 	for {
 		putAppendReply := PutAppendReply{}
 		leaderID = ck.leaderID
-		if lastReplyErr == "ErrWrongLeader" || leaderID == -1 {
+		if lastReplyErrLeader || leaderID == -1 {
 			leaderID = ck.getRandServer()
 		}
 		ok = ck.servers[leaderID].Call("KVServer.PutAppend", &putAppendArgs, &putAppendReply)
 		if !ok || putAppendReply.Err == "ErrWrongLeader" {
-			lastReplyErr = putAppendReply.Err
+			lastReplyErrLeader = true
 			continue
 		}
 		PrettyDebug(dClient, "Client %d Send PUTAPPEND to Server %d, send args %s and receive %s ", ck.clientID, leaderID, putAppendArgs.String(), putAppendReply.String())
@@ -116,11 +117,12 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 		switch putAppendReply.Err {
 		case "OK":
 			PrettyDebug(dClient, "Client %d Send PUTAPPEND to Server %d successfully", ck.clientID, leaderID)
+			lastReplyErrLeader = false
 			ck.leaderID = leaderID
 			ck.seqNum++
 			return
 		}
-		time.Sleep(100 * time.Millisecond)
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
