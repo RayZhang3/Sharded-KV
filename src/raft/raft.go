@@ -51,6 +51,7 @@ type ApplyMsg struct {
 	Command      interface{}
 	CommandIndex int
 
+	ApplyTerm int
 	// For 2D:
 	SnapshotValid bool
 	Snapshot      []byte
@@ -1267,6 +1268,7 @@ func (rf *Raft) applyChecker() {
 						CommandValid: true,
 						Command:      rf.Log[rf.getRealLogIndex(rf.lastApplied)].Command,
 						CommandIndex: rf.lastApplied,
+						ApplyTerm:    rf.Log[rf.getRealLogIndex(rf.lastApplied)].Term,
 					}
 					rf.mu.Unlock()
 					rf.applyCh <- applyMsg
