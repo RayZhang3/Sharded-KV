@@ -37,11 +37,12 @@ func (op *Op) String() string {
 }
 
 type KVServer struct {
-	mu      sync.Mutex
-	me      int
-	rf      *raft.Raft
-	applyCh chan raft.ApplyMsg
-	dead    int32 // set by Kill()
+	mu       sync.Mutex
+	chanLock sync.Mutex
+	me       int
+	rf       *raft.Raft
+	applyCh  chan raft.ApplyMsg
+	dead     int32 // set by Kill()
 
 	maxraftstate int // snapshot if log grows this big
 
@@ -66,48 +67,45 @@ func (kv *KVServer) applyHandler() {
 				op, _ := applyMsg.Command.(Op)
 				// PrettyDebug(dServer, "Server%d get valid command %s", kv.me, op.String())
 				appliedOp := Op{op.ClientID, op.SeqNum, op.Key, op.Value, op.Optype}
+				// Reply SESSION_EXPIRED if no record of clientID or if response for client's sequenceNum already discarded
 				kv.mu.Lock()
-
 				// check if the client session is existing, if not, init one with 0
 				_, clientIsPresent := kv.clientSeq[appliedOp.ClientID]
 				if !clientIsPresent {
 					kv.clientSeq[appliedOp.ClientID] = 0
 				}
-
-				commandIndex := applyMsg.CommandIndex
-				// If sequenceNum already processed from client, reply OK with stored response
-
 				// Check duplicated command
-				// If duplicated command, reply OK with stored response
+				// If sequenceNum already processed from client, reply OK with stored response
 				if kv.clientSeq[appliedOp.ClientID] >= appliedOp.SeqNum {
-					PrettyDebug(dServer, "Server%d sequenceNum already processed from client %d, appliedOp: %s, kv.clientSeq: %v",
-						kv.me, appliedOp.ClientID, appliedOp.String(), kv.clientSeq)
 					if appliedOp.Optype == "Get" {
 						appliedOp.Value = kv.currentState[appliedOp.Key]
 					}
-					isLeader, currentTerm, _ := kv.rf.RaftState()
-					if applyMsg.ApplyTerm != currentTerm || !isLeader {
-						kv.mu.Unlock()
-						continue
-					}
-					waitCh, isPresent := kv.waitChan[commandIndex]
-					if isPresent {
-						waitCh <- appliedOp
-					}
-					kv.mu.Unlock()
+					//PrettyDebug(dServer, "Server%d sequenceNum already processed from client %d, appliedOp: %s, kv.clientSeq: %v",
+					//kv.me, appliedOp.ClientID, appliedOp.String(), kv.clientSeq)
 				} else {
+					// If sequenceNum not processed, store response and reply OK
+					if appliedOp.Optype == "Get" {
+						appliedOp.Value = kv.currentState[appliedOp.Key]
+					}
 					kv.applyToStateMachine(&appliedOp)
-					// if the channel is existing, and the leader is still alive, send the appliedOp to the channel
-					isLeader, currentTerm, _ := kv.rf.RaftState()
-					if applyMsg.ApplyTerm != currentTerm || !isLeader {
-						kv.mu.Unlock()
-						continue
+					//PrettyDebug(dServer, "Server%d apply command %s, kv.currentState:%v", kv.me, appliedOp.String(), kv.currentState)
+				}
+
+				// if the channel is existing, and the leader is still alive, send the appliedOp to the channel
+				kv.mu.Unlock()
+				kv.chanLock.Lock()
+				commandIndex := applyMsg.CommandIndex
+				waitChan, chanExisting := kv.waitChan[commandIndex]
+				if chanExisting {
+					select {
+					case waitChan <- appliedOp:
+						kv.chanLock.Unlock()
+					case <-time.After(1 * time.Second):
+						fmt.Println("Leader chan timeout")
+						kv.chanLock.Unlock()
 					}
-					waitCh, isPresent := kv.waitChan[commandIndex]
-					if isPresent {
-						waitCh <- appliedOp
-					}
-					kv.mu.Unlock()
+				} else {
+					kv.chanLock.Unlock()
 				}
 			}
 		}
@@ -115,20 +113,16 @@ func (kv *KVServer) applyHandler() {
 }
 
 func (kv *KVServer) applyToStateMachine(appliedOp *Op) {
-	// If sequenceNum not processed, store response and reply OK
 	// update the clientSeq
-	// apply the command to state machine
 	kv.clientSeq[appliedOp.ClientID] = appliedOp.SeqNum
+	// apply the command to state machine
 	switch appliedOp.Optype {
-	case "Get":
-		appliedOp.Value = kv.currentState[appliedOp.Key]
 	case "Put":
 		kv.currentState[appliedOp.Key] = appliedOp.Value
 	case "Append":
 		currValue := kv.currentState[appliedOp.Key]
 		kv.currentState[appliedOp.Key] = currValue + appliedOp.Value
 	}
-	PrettyDebug(dServer, "Server%d apply command %s, kv.currentState:%v", kv.me, appliedOp.String(), kv.currentState)
 }
 
 // get the wait channel for the index, if not exist, create one
@@ -138,7 +132,7 @@ func (kv *KVServer) getWaitCh(index int) (waitCh chan Op) {
 	if isPresent {
 		return waitCh
 	} else {
-		kv.waitChan[index] = make(chan Op)
+		kv.waitChan[index] = make(chan Op, 1)
 		return kv.waitChan[index]
 	}
 }
@@ -146,97 +140,86 @@ func (kv *KVServer) getWaitCh(index int) (waitCh chan Op) {
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
 
-	isLeader, _, leaderHint := kv.rf.RaftState()
+	_, isLeader := kv.rf.GetState()
 
 	// Reply NOT_Leader if not leader, providing hint when available
 	if !isLeader {
 		reply.Err = ErrWrongLeader
-		reply.LeaderHint = leaderHint
 		return
 	}
 
-	kv.mu.Lock()
 	// Append command to log, replicate and commit it
 	op := Op{args.ClientID, args.SeqNum, args.Key, "", "Get"}
-	PrettyDebug(dServer, "Server%d insert GET command to raft, COMMAND %s", kv.me, op.String())
-	kv.mu.Unlock()
+	// PrettyDebug(dServer, "Server%d insert GET command to raft Log, COMMAND %s", kv.me, op.String())
 
 	index, _, isLeader := kv.rf.Start(op)
-
-	kv.mu.Lock()
 	if !isLeader {
 		reply.Err = ErrWrongLeader
-		reply.LeaderHint = -1
-		kv.mu.Unlock()
 		return
 	}
-	waitCh := kv.getWaitCh(index)
-	kv.mu.Unlock()
-	// wait for appliedOp from applyHandler
-	timer := time.NewTicker(1e8)
 
-	defer func() {
-		timer.Stop()
-		kv.mu.Lock()
-		close(waitCh)
-		delete(kv.waitChan, index)
-		kv.mu.Unlock()
-	}()
+	kv.chanLock.Lock()
+	waitCh := kv.getWaitCh(index)
+	kv.chanLock.Unlock()
+
+	// wait for appliedOp from applyHandler
 
 	select {
-	case <-timer.C:
+	case <-time.After(7e8):
 		reply.Err = ErrWrongLeader
-		reply.LeaderHint = -1
-		return
 
 	case applyOp, ok := <-waitCh:
 		if !ok {
 			reply.Err = ErrWrongLeader
-			reply.LeaderHint = -1
+			go func() {
+				kv.chanLock.Lock()
+				close(waitCh)
+				delete(kv.waitChan, index)
+				kv.chanLock.Unlock()
+			}()
 			return
 		}
+
 		PrettyDebug(dServer, "Server%d receive GET command from raft, COMMAND %s", kv.me, op.String())
 		if applyOp.SeqNum == args.SeqNum && applyOp.ClientID == args.ClientID {
 			reply.Value = applyOp.Value
 			reply.Err = OK
-			reply.LeaderHint = kv.me
-			return
 		} else {
 			reply.Err = ErrWrongLeader
-			reply.LeaderHint = -1
-			return
 		}
 	}
+	go func() {
+		kv.chanLock.Lock()
+		close(waitCh)
+		delete(kv.waitChan, index)
+		kv.chanLock.Unlock()
+	}()
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
-	isLeader, _, leaderHint := kv.rf.RaftState()
+	_, isLeader := kv.rf.GetState()
 
 	// Reply NOT_Leader if not leader, providing hint when available
 	if !isLeader {
 		reply.Err = ErrWrongLeader
-		reply.LeaderHint = leaderHint
 		return
 	}
 
 	// Append command to log, replicate and commit it
-	kv.mu.Lock()
-	op := Op{args.ClientID, args.SeqNum, args.Key, args.Value, args.Op}
-	kv.mu.Unlock()
 
+	op := Op{args.ClientID, args.SeqNum, args.Key, args.Value, args.Op}
 	index, _, isLeader := kv.rf.Start(op)
 
-	kv.mu.Lock()
 	if !isLeader {
 		reply.Err = ErrWrongLeader
-		reply.LeaderHint = leaderHint
-		kv.mu.Unlock()
 		return
 	}
+	//PrettyDebug(dServer, "Server%d insert PUTAPPEND command to raft, COMMAND %s", kv.me, op.String())
+
+	kv.chanLock.Lock()
 	waitCh := kv.getWaitCh(index)
-	PrettyDebug(dServer, "Server%d insert PUTAPPEND command to raft, COMMAND %s", kv.me, op.String())
-	kv.mu.Unlock()
+	kv.chanLock.Unlock()
 
 	// If sequenceNum already processed from client, reply OK with stored response
 	// Apply command in log order
@@ -244,39 +227,35 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 
 	// wait for appliedOp from applyHandler
 
-	timer := time.NewTicker(1e8)
-
-	defer func() {
-		timer.Stop()
-		kv.mu.Lock()
-		close(waitCh)
-		delete(kv.waitChan, index)
-		kv.mu.Unlock()
-	}()
-
 	select {
-	case <-timer.C:
+	case <-time.After(7e8):
 		reply.Err = ErrWrongLeader
-		reply.LeaderHint = -1
-		return
 	case applyOp, ok := <-waitCh:
 		if !ok {
 			reply.Err = ErrWrongLeader
-			reply.LeaderHint = -1
+			go func() {
+				kv.chanLock.Lock()
+				close(waitCh)
+				delete(kv.waitChan, index)
+				kv.chanLock.Unlock()
+			}()
 			return
 		}
-		PrettyDebug(dServer, "Server%d receive PutAppend command from raft, COMMAND %s", kv.me, op.String())
+
+		PrettyDebug(dServer, "Server%d receive GET command from raft, COMMAND %s", kv.me, op.String())
+
 		if applyOp.SeqNum == args.SeqNum && applyOp.ClientID == args.ClientID {
 			reply.Err = OK
-			reply.LeaderHint = kv.me
-			return
 		} else {
 			reply.Err = ErrWrongLeader
-			reply.LeaderHint = -1
-			return
 		}
 	}
-
+	go func() {
+		kv.chanLock.Lock()
+		close(waitCh)
+		delete(kv.waitChan, index)
+		kv.chanLock.Unlock()
+	}()
 }
 
 //
