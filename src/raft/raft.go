@@ -106,6 +106,7 @@ type Raft struct {
 	lastIncludedTerm  int
 	snapShot          []byte
 	// End
+	applyCond *sync.Cond
 }
 
 func (rf *Raft) GetStateSize() int {
@@ -450,7 +451,8 @@ func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int,
 	// Trim log
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	if lastIncludedIndex <= rf.commitIndex || lastIncludedIndex <= rf.lastIncludedIndex {
+	// if lastIncludedIndex <= rf.commitIndex || lastIncludedIndex <= rf.lastIncludedIndex {
+	if lastIncludedIndex <= rf.commitIndex {
 		return false
 	}
 
@@ -477,7 +479,11 @@ func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int,
 	if rf.lastApplied < rf.lastIncludedIndex {
 		rf.lastApplied = rf.lastIncludedIndex
 	}
-
+	/*
+		// wakeup applychecker
+		rf.applyCond.Broadcast()
+		PrettyDebug(dLog, "Leader S%d wake up apply checker", rf.me)
+	*/
 	// Reset state machine using snapshot contents
 	data := rf.getStatePersistData()
 	rf.persister.SaveStateAndSnapshot(data, snapshot)
@@ -630,6 +636,10 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// Reset timer
 	rf.lastTimeHeared = time.Now()
 
+	// wake up apply checker
+	rf.applyCond.Broadcast()
+	PrettyDebug(dLog, "S%d wake up apply checker", rf.me)
+
 	// Receive HeartBeat, Entries == nil
 	if args.Entries == nil || len(args.Entries) == 0 {
 		rf.debugHeartBeat(args)
@@ -752,6 +762,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// Set reply
 	reply.Term = rf.currentTerm
 	reply.Success = true
+
 }
 
 //
@@ -844,11 +855,11 @@ func (rf *Raft) leaderAppendEntries() {
 
 			rf.mu.Lock()
 			// output a string of raft
-			/*
-				stateString := fmt.Sprintf("Raft{State: %d,  CurrentTerm: %d, VotedFor: %d, CommitIndex: %d, LastApplied: %d, GetVotesNum: %d, NextIndex: %v, MatchIndex: %v, LastIncludedIndex: %v, LastIncludedTerm: %v, Log: %s}",
-					rf.state, rf.currentTerm, rf.votedFor, rf.commitIndex, rf.lastApplied, rf.getVotesNum, rf.nextIndex, rf.matchIndex, rf.lastIncludedIndex, rf.lastIncludedTerm, getLogString(rf.Log))
-				PrettyDebug(dSnap, "S%d state %s", rf.me, stateString)
-			*/
+
+			stateString := fmt.Sprintf("Raft{State: %d,  CurrentTerm: %d, VotedFor: %d, CommitIndex: %d, LastApplied: %d, GetVotesNum: %d, NextIndex: %v, MatchIndex: %v, LastIncludedIndex: %v, LastIncludedTerm: %v, Log: %s}",
+				rf.state, rf.currentTerm, rf.votedFor, rf.commitIndex, rf.lastApplied, rf.getVotesNum, rf.nextIndex, rf.matchIndex, rf.lastIncludedIndex, rf.lastIncludedTerm, getLogString(rf.Log))
+			PrettyDebug(dSnap, "S%d state %s", rf.me, stateString)
+
 			// Set args
 			PrevLogIndex := rf.nextIndex[index] - 1
 			if PrevLogIndex < rf.lastIncludedIndex {
@@ -865,27 +876,7 @@ func (rf *Raft) leaderAppendEntries() {
 					rf.mu.Unlock()
 					return
 				}
-				/*
-					retry := 0
-					for !ok && retry < 5 && !rf.killed() && rf.state == LEADER && rf.currentTerm == InstallSnapshotArgs.Term {
-						retry++
-						rf.mu.Unlock()
-						ok = rf.sendInstallSnapshot(index, InstallSnapshotArgs, reply)
-						rf.mu.Lock()
-						if reply.Term > rf.currentTerm {
-							rf.FollowerState(reply.Term)
-							rf.mu.Unlock()
-							return
-						}
-						if rf.state != LEADER {
-							rf.mu.Unlock()
-							return
-						}
-						if !ok {
-							time.Sleep(100 * time.Millisecond)
-						}
-					}
-				*/
+
 				// Lab 3B
 				rf.mu.Unlock()
 				ok = rf.sendInstallSnapshot(index, InstallSnapshotArgs, reply)
@@ -911,6 +902,7 @@ func (rf *Raft) leaderAppendEntries() {
 					rf.mu.Unlock()
 					return
 				}
+
 				if reply.Term == rf.currentTerm {
 					if rf.matchIndex[index] <= InstallSnapshotArgs.LastIncludedIndex {
 						rf.matchIndex[index] = InstallSnapshotArgs.LastIncludedIndex
@@ -918,6 +910,11 @@ func (rf *Raft) leaderAppendEntries() {
 					}
 				}
 				rf.commitIndex = rf.countReplica()
+
+				// wake up applychecker
+				rf.applyCond.Broadcast()
+				PrettyDebug(dLog, "Leader S%d wake up apply checker", rf.me)
+
 				PrettyDebug(dLog, "S%d finished send installSnapShot, couting replica is %d", rf.me, rf.commitIndex)
 				PrettyDebug(dSnap, "S%d finished installSnapShot RPC to S%d %s", rf.me, index, InstallSnapshotArgs.String())
 				stateString = fmt.Sprintf("Raft{State: %d,  CurrentTerm: %d, VotedFor: %d, CommitIndex: %d, LastApplied: %d, GetVotesNum: %d, NextIndex: %v, MatchIndex: %v, LastIncludedIndex: %v, LastIncludedTerm: %v, Log: %s}",
@@ -1001,6 +998,9 @@ func (rf *Raft) leaderAppendEntries() {
 			// N > commitIndex, a majority of matchIndex[i] ≥ N, and log[N].term == currentTerm:
 			// set commitIndex = N (§5.3, §5.4).
 			rf.commitIndex = rf.countReplica()
+			// wake up applychecker
+			rf.applyCond.Broadcast()
+			PrettyDebug(dLog, "Leader S%d wake up apply checker", rf.me)
 			/*
 				PrettyDebug(dLog, "S%d finished send AppendEntries, couting replica is %d", rf.me, rf.commitIndex)
 				stateString = fmt.Sprintf("Raft{State: %d,  CurrentTerm: %d, VotedFor: %d, CommitIndex: %d, LastApplied: %d, GetVotesNum: %d, NextIndex: %v, MatchIndex: %v, LastIncludedIndex: %v, LastIncludedTerm: %v, Log: %s}",
@@ -1183,6 +1183,7 @@ func (rf *Raft) heartBeat() {
 			rf.mu.Lock()
 			if rf.state != LEADER {
 				rf.mu.Unlock()
+				time.Sleep(10 * time.Millisecond)
 				continue
 			}
 			rf.mu.Unlock()
@@ -1252,50 +1253,53 @@ func (rf *Raft) ticker() {
 // you may have to wait until the next entry is appended to the log
 // before applying the entry you just sent out and got acknowledged.
 func (rf *Raft) applyChecker() {
-	// Heatbeat time out
-	ApplyTimeout := make(chan bool)
-	go func() {
-		for rf.killed() == false {
-			//time.Sleep(1e8)
-			time.Sleep(5e7)
-			ApplyTimeout <- true
-		}
-	}()
+	/*
+		go func() {
+			for rf.killed() == false {
+				//time.Sleep(1e8)
+				time.Sleep(1e8)
+				rf.applyCond.Broadcast()
+			}
+		}()
+	*/
 	for rf.killed() == false {
-		if <-ApplyTimeout {
-			rf.mu.Lock()
-			commitIndex := rf.commitIndex
-			lastApplied := rf.lastApplied
-			firstLogIndex := rf.lastIncludedIndex
-			// If commitIndex > lastApplied: increment lastApplied,
-			// apply log[lastApplied] to state machine (§5.3)
-			if commitIndex <= lastApplied {
+		rf.mu.Lock()
+		for rf.lastApplied >= rf.commitIndex {
+			rf.applyCond.Wait()
+			if rf.killed() {
 				rf.mu.Unlock()
-				time.Sleep(10 * time.Millisecond)
-				continue
+				return
 			}
-			// commitIndex > lastApplied
-			entries := make([]LogEntry, commitIndex-lastApplied)
-			copy(entries, rf.Log[lastApplied+1-firstLogIndex:commitIndex+1-firstLogIndex])
-			rf.mu.Unlock()
-
-			for _, entry := range entries {
-				//PrettyDebug(dLog, "S%d Apply Entries at %d, commitIndex is %d, Log is %s ", rf.me, rf.lastApplied+1, rf.commitIndex, getLogString(rf.Log))
-				applyMsg := ApplyMsg{
-					CommandValid: true,
-					Command:      entry.Command,
-					CommandIndex: entry.Index,
-				}
-				rf.applyCh <- applyMsg
-			}
-
-			rf.mu.Lock()
-			if commitIndex > rf.lastApplied {
-				rf.lastApplied = commitIndex
-			}
-			rf.mu.Unlock()
 		}
-		time.Sleep(10 * time.Millisecond)
+		commitIndex := rf.commitIndex
+		lastApplied := rf.lastApplied
+		firstLogIndex := rf.lastIncludedIndex
+		// If commitIndex > lastApplied: increment lastApplied,
+		// apply log[lastApplied] to state machine (§5.3)
+
+		// commitIndex > lastApplied
+		entries := make([]LogEntry, commitIndex-lastApplied)
+		copy(entries, rf.Log[lastApplied+1-firstLogIndex:commitIndex+1-firstLogIndex])
+		PrettyDebug(dLog, "S%d Apply Entries at %d, commitIndex is %d, Apply Log is %v ", rf.me, rf.lastApplied+1, rf.commitIndex, entries)
+		rf.mu.Unlock()
+
+		for _, entry := range entries {
+			applyMsg := ApplyMsg{
+				CommandValid: true,
+				Command:      entry.Command,
+				CommandIndex: entry.Index,
+			}
+			rf.applyCh <- applyMsg
+		}
+
+		rf.mu.Lock()
+		if commitIndex > rf.lastApplied {
+			rf.lastApplied = commitIndex
+		}
+		stateString := fmt.Sprintf("After apply, Raft {State: %d,  CurrentTerm: %d, VotedFor: %d, CommitIndex: %d, LastApplied: %d, GetVotesNum: %d, NextIndex: %v, MatchIndex: %v, LastIncludedIndex: %v, LastIncludedTerm: %v, Log: %s}",
+			rf.state, rf.currentTerm, rf.votedFor, rf.commitIndex, rf.lastApplied, rf.getVotesNum, rf.nextIndex, rf.matchIndex, rf.lastIncludedIndex, rf.lastIncludedTerm, getLogString(rf.Log))
+		PrettyDebug(dSnap, "S%d state %s", rf.me, stateString)
+		rf.mu.Unlock()
 	}
 }
 
@@ -1371,6 +1375,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.lastIncludedIndex = 0
 	rf.lastIncludedTerm = 0
 	rf.snapShot = nil
+
+	// Lab 3
+	rf.applyCond = sync.NewCond(&rf.mu)
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
