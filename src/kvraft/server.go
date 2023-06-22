@@ -47,11 +47,10 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
-	currentState     map[string]string
-	waitChan         map[int]chan Op
-	clientSeq        map[int64]int
-	lastAppliedIndex int // for snapshot
-	persister        *raft.Persister
+	currentState      map[string]string
+	waitChan          map[int]chan Op
+	clientSeq         map[int64]int
+	lastIncludedIndex int // for snapshot
 }
 
 func (kv *KVServer) getServerPersistData() []byte {
@@ -89,8 +88,12 @@ func (kv *KVServer) applyHandler() {
 		case applyMsg := <-kv.applyCh:
 			if applyMsg.CommandValid == false && applyMsg.SnapshotValid == true {
 				kv.mu.Lock()
+				if !kv.rf.CondInstallSnapshot(applyMsg.SnapshotTerm, applyMsg.SnapshotIndex, applyMsg.Snapshot) {
+					kv.mu.Unlock()
+					continue
+				}
 				kv.readServerPersistData(applyMsg.Snapshot)
-				kv.lastAppliedIndex = applyMsg.SnapshotIndex
+				kv.lastIncludedIndex = applyMsg.SnapshotIndex
 				PrettyDebug(dPersist, "Server %d receive snapshot with applyMsg.SnapshotIndex %d, kv.currentState:%v, kv.clientSeq:%v", kv.me, applyMsg.SnapshotIndex, kv.currentState, kv.clientSeq)
 				kv.mu.Unlock()
 			} else {
@@ -101,12 +104,11 @@ func (kv *KVServer) applyHandler() {
 				kv.mu.Lock()
 
 				// Lab 3B: check if the applyMsg have been applied before
-				if applyMsg.CommandIndex <= kv.lastAppliedIndex {
+				if applyMsg.CommandIndex <= kv.lastIncludedIndex {
 					kv.mu.Unlock()
 					continue
-				} else {
-					kv.lastAppliedIndex = applyMsg.CommandIndex
 				}
+
 				// check if the client session is existing, if not, init one with 0
 				_, clientIsPresent := kv.clientSeq[appliedOp.ClientID]
 				if !clientIsPresent {
@@ -129,6 +131,12 @@ func (kv *KVServer) applyHandler() {
 					//PrettyDebug(dServer, "Server%d apply command %s, kv.currentState:%v", kv.me, appliedOp.String(), kv.currentState)
 				}
 
+				if kv.maxraftstate != -1 && kv.rf.GetStateSize() > kv.maxraftstate {
+					snapshotData := kv.getServerPersistData()
+					kv.rf.Snapshot(applyMsg.CommandIndex, snapshotData)
+					PrettyDebug(dPersist, "Server %d store snapshot with commandIndex %d, kv.currentState:%v, kv.clientSeq:%v", kv.me, applyMsg.CommandIndex, kv.currentState, kv.clientSeq)
+				}
+
 				// if the channel is existing, and the leader is still alive, send the appliedOp to the channel
 				commandIndex := applyMsg.CommandIndex
 				waitChan, chanExisting := kv.waitChan[commandIndex]
@@ -138,12 +146,6 @@ func (kv *KVServer) applyHandler() {
 					case <-time.After(1 * time.Second):
 						fmt.Println("Leader chan timeout")
 					}
-				}
-
-				if kv.maxraftstate != -1 && kv.persister.RaftStateSize() > kv.maxraftstate {
-					snapshotData := kv.getServerPersistData()
-					kv.rf.Snapshot(commandIndex, snapshotData)
-					PrettyDebug(dPersist, "Server %d store snapshot with commandIndex %d, kv.currentState:%v, kv.clientSeq:%v", kv.me, commandIndex, kv.currentState, kv.clientSeq)
 				}
 				kv.mu.Unlock()
 			}
@@ -346,16 +348,16 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
-	// Lab 3B
-	kv.persister = persister
 	// You may need initialization code here.
 	kv.currentState = make(map[string]string, 0)
 	kv.waitChan = make(map[int]chan Op, 0)
 	kv.clientSeq = make(map[int64]int, 0)
 
-	snapshot := kv.persister.ReadSnapshot()
+	snapshot := kv.rf.GetSnapshot()
 	if len(snapshot) > 0 {
+		kv.mu.Lock()
 		kv.readServerPersistData(snapshot)
+		kv.mu.Unlock()
 	}
 
 	go kv.applyHandler()

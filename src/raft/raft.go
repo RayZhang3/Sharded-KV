@@ -106,11 +106,17 @@ type Raft struct {
 	lastIncludedTerm  int
 	snapShot          []byte
 	// End
-	// Lab3 update current leader
-	currentLeader int
 }
 
-func (rf Raft) String() string {
+func (rf *Raft) GetStateSize() int {
+	return rf.persister.RaftStateSize()
+}
+
+func (rf *Raft) GetSnapshot() []byte {
+	return rf.persister.ReadSnapshot()
+}
+
+func (rf *Raft) String() string {
 	return fmt.Sprintf("Raft{State: %d,  CurrentTerm: %d, VotedFor: %d, CommitIndex: %d, LastApplied: %d, GetVotesNum: %d, NextIndex: %v, MatchIndex: %v, Log: %s}",
 		rf.state, rf.currentTerm, rf.votedFor, rf.commitIndex, rf.lastApplied, rf.getVotesNum, rf.nextIndex, rf.matchIndex, getLogString(rf.Log))
 }
@@ -253,8 +259,6 @@ type InstallSnapshotArgs struct {
 	LastIncludedIndex int
 	LastIncludedTerm  int
 	Data              []byte
-	// Lab3 currentLeader
-	CurrentLeader int
 }
 
 func (rvr InstallSnapshotArgs) String() string {
@@ -270,13 +274,12 @@ type InstallSnapshotReply struct {
 // AppendEntries RPC arguments structure
 //
 type AppendEntriesArgs struct {
-	Term          int        // leader's term
-	LeaderId      int        // so follower can redirect clients
-	PrevLogIndex  int        // index of log entry immediately preceding new ones
-	PrevLogTerm   int        // term of prevLogIndex entry
-	Entries       []LogEntry // log entries to store (empty for heartbeat; may send more than one for efficiency)
-	LeaderCommit  int        // leader's commitIndex
-	CurrentLeader int
+	Term         int        // leader's term
+	LeaderId     int        // so follower can redirect clients
+	PrevLogIndex int        // index of log entry immediately preceding new ones
+	PrevLogTerm  int        // term of prevLogIndex entry
+	Entries      []LogEntry // log entries to store (empty for heartbeat; may send more than one for efficiency)
+	LeaderCommit int        // leader's commitIndex
 }
 
 func (aea AppendEntriesArgs) String() string {
@@ -330,8 +333,6 @@ func (rf *Raft) LeaderState() {
 		rf.nextIndex[i] = rf.getLastLogIndex() + 1
 		rf.matchIndex[i] = -1
 	}
-	// Lab3
-	rf.currentLeader = rf.me
 }
 
 func (rf *Raft) FollowerState(newTerm int) {
@@ -340,8 +341,6 @@ func (rf *Raft) FollowerState(newTerm int) {
 	rf.currentTerm = newTerm
 	rf.votedFor = -1 // reset the vote
 	rf.getVotesNum = 0
-	// Lab3
-	rf.currentLeader = -1
 	rf.persist()
 }
 
@@ -350,8 +349,6 @@ func (rf *Raft) CandidateState() {
 	rf.currentTerm += 1
 	rf.votedFor = rf.me
 	rf.getVotesNum = 1 // vote for itself
-	// Lab3
-	rf.currentLeader = -1
 	rf.persist()
 	//PrettyDebug(dVote, "S%d becomes CANDIDATE", rf.me)
 
@@ -446,7 +443,44 @@ func (rf *Raft) readPersist(data []byte) {
 func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int, snapshot []byte) bool {
 
 	// Your code here (2D).
+	// 6. If existing log entry has same index and term as snapshot’s
+	// 	  last included entry, retain log entries following it and reply
+	// 7. Discard the entire log
 
+	// Trim log
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if lastIncludedIndex <= rf.commitIndex || lastIncludedIndex <= rf.lastIncludedIndex {
+		return false
+	}
+
+	// trim Log
+	trimIndex := len(rf.Log)
+	for i := len(rf.Log) - 1; i >= 0; i-- {
+		_, entryIndex, entryTerm := rf.getLogAt(i)
+		if (entryTerm == lastIncludedTerm) && (entryIndex == lastIncludedIndex) {
+			trimIndex = i + 1
+			break
+		}
+	}
+	newLog := make([]LogEntry, 1)
+	newLogTail := make([]LogEntry, len(rf.Log[trimIndex:]))
+	copy(newLogTail, rf.Log[trimIndex:])
+	rf.Log = append(newLog, newLogTail...)
+
+	rf.lastIncludedIndex = lastIncludedIndex
+	rf.lastIncludedTerm = lastIncludedTerm
+
+	if rf.commitIndex < rf.lastIncludedIndex {
+		rf.commitIndex = rf.lastIncludedIndex
+	}
+	if rf.lastApplied < rf.lastIncludedIndex {
+		rf.lastApplied = rf.lastIncludedIndex
+	}
+
+	// Reset state machine using snapshot contents
+	data := rf.getStatePersistData()
+	rf.persister.SaveStateAndSnapshot(data, snapshot)
 	return true
 }
 
@@ -610,9 +644,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// Log misamtch
 	// Reply false if log doesn’t contain an entry at prevLogIndex whose term matches prevLogTerm
 
-	// Lab3 update current leader
-	rf.currentLeader = args.LeaderId
-
 	firstLogIndex := rf.lastIncludedIndex
 	lastLogIndex := rf.getLastLogIndex()
 	var contains bool
@@ -768,59 +799,29 @@ func (rf *Raft) sendInstallSnapshot(server int, args *InstallSnapshotArgs, reply
 }
 
 func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
+	PrettyDebug(dSnap, "S%d receive InstallSnapshot from S%d, args: %v", rf.me, args.LeaderId, args)
 	rf.mu.Lock()
 	if args.Term > rf.currentTerm {
 		rf.FollowerState(args.Term)
+	} else if rf.currentTerm > args.Term {
+		reply.Term = rf.currentTerm
+		rf.mu.Unlock()
+		return
 	}
 
 	// reset timer
 	rf.lastTimeHeared = time.Now()
 
-	upToDate := args.LastIncludedIndex > rf.lastIncludedIndex
-	if !upToDate {
+	if args.LastIncludedIndex <= rf.commitIndex {
 		reply.Term = rf.currentTerm
 		rf.mu.Unlock()
 		return
 	}
-	// Lab3 update current leader
-	rf.currentLeader = args.LeaderId
 
 	snapShopCopy := make([]byte, len(args.Data))
 	copy(snapShopCopy, args.Data)
 	rf.snapShot = snapShopCopy
 	reply.Term = rf.currentTerm
-
-	// 6. If existing log entry has same index and term as snapshot’s
-	// 	  last included entry, retain log entries following it and reply
-	// 7. Discard the entire log
-
-	// Trim log
-	trimIndex := len(rf.Log)
-	for i := len(rf.Log) - 1; i >= 0; i-- {
-		_, entryIndex, entryTerm := rf.getLogAt(i)
-		if (entryTerm == args.LastIncludedTerm) && (entryIndex == args.LastIncludedIndex) {
-			trimIndex = i + 1
-			break
-		}
-	}
-	newLog := make([]LogEntry, 1)
-	newLogTail := make([]LogEntry, len(rf.Log[trimIndex:]))
-	copy(newLogTail, rf.Log[trimIndex:])
-	rf.Log = append(newLog, newLogTail...)
-
-	rf.lastIncludedIndex = args.LastIncludedIndex
-	rf.lastIncludedTerm = args.LastIncludedTerm
-
-	if rf.commitIndex < rf.lastIncludedIndex {
-		rf.commitIndex = rf.lastIncludedIndex
-	}
-	if rf.lastApplied < rf.lastIncludedIndex {
-		rf.lastApplied = rf.lastIncludedIndex
-	}
-
-	// Reset state machine using snapshot contents
-	data := rf.getStatePersistData()
-	rf.persister.SaveStateAndSnapshot(data, snapShopCopy)
 
 	applyMsg := ApplyMsg{
 		SnapshotValid: true,
@@ -859,31 +860,48 @@ func (rf *Raft) leaderAppendEntries() {
 					LastIncludedIndex: rf.lastIncludedIndex,
 					LastIncludedTerm:  rf.lastIncludedTerm,
 					Data:              rf.persister.ReadSnapshot(),
-					// Lab3
-					CurrentLeader: rf.me,
 				}
 				reply := &InstallSnapshotReply{}
-
 				ok := false
-				retry := 0
-				for !ok && retry < 3 && !rf.killed() && rf.state == LEADER && rf.currentTerm == InstallSnapshotArgs.Term {
-					retry++
+				if rf.state != LEADER {
 					rf.mu.Unlock()
-					ok = rf.sendInstallSnapshot(index, InstallSnapshotArgs, reply)
-					rf.mu.Lock()
-					if reply.Term > rf.currentTerm {
-						rf.FollowerState(reply.Term)
-						rf.mu.Unlock()
-						return
-					}
-					if rf.state != LEADER {
-						rf.mu.Unlock()
-						return
-					}
-					if !ok {
-						time.Sleep(200 * time.Millisecond)
-					}
+					return
 				}
+				/*
+					retry := 0
+					for !ok && retry < 5 && !rf.killed() && rf.state == LEADER && rf.currentTerm == InstallSnapshotArgs.Term {
+						retry++
+						rf.mu.Unlock()
+						ok = rf.sendInstallSnapshot(index, InstallSnapshotArgs, reply)
+						rf.mu.Lock()
+						if reply.Term > rf.currentTerm {
+							rf.FollowerState(reply.Term)
+							rf.mu.Unlock()
+							return
+						}
+						if rf.state != LEADER {
+							rf.mu.Unlock()
+							return
+						}
+						if !ok {
+							time.Sleep(100 * time.Millisecond)
+						}
+					}
+				*/
+				// Lab 3B
+				rf.mu.Unlock()
+				ok = rf.sendInstallSnapshot(index, InstallSnapshotArgs, reply)
+				rf.mu.Lock()
+				if reply.Term > rf.currentTerm {
+					rf.FollowerState(reply.Term)
+					rf.mu.Unlock()
+					return
+				}
+				if rf.state != LEADER {
+					rf.mu.Unlock()
+					return
+				}
+				// Lab 3B
 				// send InstallSnapShot RPC
 				// need to set nextIndex and matchIndex
 				PrettyDebug(dSnap, "S%d send installSnapShot RPC to S%d %s", rf.me, index, InstallSnapshotArgs.String())
@@ -917,8 +935,6 @@ func (rf *Raft) leaderAppendEntries() {
 				//PrevLogTerm:  rf.Log[rf.getRealLogIndex(rf.nextIndex[index]-1)].Term,
 				Entries:      nil,
 				LeaderCommit: rf.commitIndex,
-				// Lab3 update CurrentLeader
-				CurrentLeader: rf.me,
 			}
 			_, _, entryTerm := rf.getLogAt(rf.getRealLogIndex(args.PrevLogIndex))
 			args.PrevLogTerm = entryTerm
@@ -1090,12 +1106,6 @@ func (rf *Raft) candidateRequestVote() {
 			rf.mu.Unlock()
 		}(i)
 	}
-}
-
-func (rf *Raft) RaftState() (bool, int, int) {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	return rf.state == LEADER, rf.currentTerm, rf.currentLeader
 }
 
 //
@@ -1354,8 +1364,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
-	// Lab3
-	rf.currentLeader = -1
 	// start ticker goroutine to start elections
 	go rf.ticker()
 	go rf.heartBeat()
