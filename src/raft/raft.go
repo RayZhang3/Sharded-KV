@@ -801,11 +801,11 @@ func (rf *Raft) sendInstallSnapshot(server int, args *InstallSnapshotArgs, reply
 func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
 	PrettyDebug(dSnap, "S%d receive InstallSnapshot from S%d, args: %v", rf.me, args.LeaderId, args)
 	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	if args.Term > rf.currentTerm {
 		rf.FollowerState(args.Term)
 	} else if rf.currentTerm > args.Term {
 		reply.Term = rf.currentTerm
-		rf.mu.Unlock()
 		return
 	}
 
@@ -814,7 +814,6 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 
 	if args.LastIncludedIndex <= rf.commitIndex {
 		reply.Term = rf.currentTerm
-		rf.mu.Unlock()
 		return
 	}
 
@@ -822,16 +821,15 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	copy(snapShopCopy, args.Data)
 	rf.snapShot = snapShopCopy
 	reply.Term = rf.currentTerm
-
-	applyMsg := ApplyMsg{
-		SnapshotValid: true,
-		Snapshot:      snapShopCopy,
-		SnapshotTerm:  args.LastIncludedTerm,
-		SnapshotIndex: args.LastIncludedIndex,
-	}
-	rf.mu.Unlock()
-	rf.applyCh <- applyMsg
-
+	go func() {
+		applyMsg := ApplyMsg{
+			SnapshotValid: true,
+			Snapshot:      snapShopCopy,
+			SnapshotTerm:  args.LastIncludedTerm,
+			SnapshotIndex: args.LastIncludedIndex,
+		}
+		rf.applyCh <- applyMsg
+	}()
 }
 
 func (rf *Raft) leaderAppendEntries() {
@@ -1224,6 +1222,7 @@ func (rf *Raft) ticker() {
 			}
 			if currentTime.Sub(rf.lastTimeHeared).Nanoseconds() < randTime {
 				rf.mu.Unlock()
+				time.Sleep(10 * time.Millisecond)
 				continue
 			}
 			rf.CandidateState()
@@ -1258,30 +1257,41 @@ func (rf *Raft) applyChecker() {
 	go func() {
 		for rf.killed() == false {
 			//time.Sleep(1e8)
-			time.Sleep(2e7)
+			time.Sleep(5e7)
 			ApplyTimeout <- true
 		}
 	}()
 	for rf.killed() == false {
 		if <-ApplyTimeout {
 			rf.mu.Lock()
-			commmitIndex := rf.commitIndex
-			LastLogIndex := rf.getLastLogIndex()
+			commitIndex := rf.commitIndex
+			lastApplied := rf.lastApplied
+			firstLogIndex := rf.lastIncludedIndex
 			// If commitIndex > lastApplied: increment lastApplied,
 			// apply log[lastApplied] to state machine (§5.3)
-			if commmitIndex > rf.lastApplied {
-				for (rf.lastApplied < commmitIndex) && (rf.lastApplied < LastLogIndex) {
-					//PrettyDebug(dLog, "S%d Apply Entries at %d, commitIndex is %d, Log is %s ", rf.me, rf.lastApplied+1, rf.commitIndex, getLogString(rf.Log))
-					rf.lastApplied++
-					applyMsg := ApplyMsg{
-						CommandValid: true,
-						Command:      rf.Log[rf.getRealLogIndex(rf.lastApplied)].Command,
-						CommandIndex: rf.lastApplied,
-					}
-					rf.mu.Unlock()
-					rf.applyCh <- applyMsg
-					rf.mu.Lock()
+			if commitIndex <= lastApplied {
+				rf.mu.Unlock()
+				time.Sleep(10 * time.Millisecond)
+				continue
+			}
+			// commitIndex > lastApplied
+			entries := make([]LogEntry, commitIndex-lastApplied)
+			copy(entries, rf.Log[lastApplied+1-firstLogIndex:commitIndex+1-firstLogIndex])
+			rf.mu.Unlock()
+
+			for _, entry := range entries {
+				//PrettyDebug(dLog, "S%d Apply Entries at %d, commitIndex is %d, Log is %s ", rf.me, rf.lastApplied+1, rf.commitIndex, getLogString(rf.Log))
+				applyMsg := ApplyMsg{
+					CommandValid: true,
+					Command:      entry.Command,
+					CommandIndex: entry.Index,
 				}
+				rf.applyCh <- applyMsg
+			}
+
+			rf.mu.Lock()
+			if commitIndex > rf.lastApplied {
+				rf.lastApplied = commitIndex
 			}
 			rf.mu.Unlock()
 		}
