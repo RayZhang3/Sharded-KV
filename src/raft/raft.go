@@ -504,7 +504,8 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	var entryIndex int
 	var entryTerm int
 	var realIndex int
-	for i := 0; i < len(rf.Log); i++ {
+	var i int
+	for i = 0; i < len(rf.Log); i++ {
 		_, entryIndex, entryTerm = rf.getLogAt(i)
 		if entryIndex == index {
 			realIndex = i
@@ -514,6 +515,21 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	rf.lastIncludedIndex = entryIndex
 	rf.lastIncludedTerm = entryTerm
 
+	if i == len(rf.Log) {
+		PrettyDebug(dError, "S%d snapshot cannot find Index at Log", rf.me)
+	}
+
+	if rf.lastApplied < index {
+		rf.lastApplied = index
+	}
+	if rf.commitIndex < index {
+		rf.commitIndex = index
+	}
+	/*
+		if (rf.lastApplied < index) || (rf.commitIndex < index) {
+			PrettyDebug(dError, "S%d Snapshot error, rf.lastApplied: %d, rf.commitIndex: %d, index: %d", rf.me, rf.lastApplied, rf.commitIndex, index)
+		}
+	*/
 	logHead := make([]LogEntry, 1)
 	rf.Log = rf.Log[realIndex+1:]
 	rf.Log = append(logHead, rf.Log...)
@@ -822,7 +838,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 
 	// reset timer
 	rf.lastTimeHeared = time.Now()
-
+	// Lab3 maybe args.LastIncludedIndex < rf.commitIndex?
 	if args.LastIncludedIndex <= rf.commitIndex {
 		reply.Term = rf.currentTerm
 		return
@@ -902,11 +918,14 @@ func (rf *Raft) leaderAppendEntries() {
 					rf.mu.Unlock()
 					return
 				}
-
+				// Bug: need to consider when matchIndex > lastIncludedIndex && nextIndex < rf.lastIncludedIndex, update nextIndex
+				// nextIndex changed by XIndex, so need to check again
+				// I fixed this bug by adding a judgement before updating nextIndex with XIndex.
 				if reply.Term == rf.currentTerm {
 					if rf.matchIndex[index] <= InstallSnapshotArgs.LastIncludedIndex {
 						rf.matchIndex[index] = InstallSnapshotArgs.LastIncludedIndex
 						rf.nextIndex[index] = rf.matchIndex[index] + 1
+						// if InstallSnapshotArgs.LastIncludedIndex < matchIndex
 					}
 				}
 				rf.commitIndex = rf.countReplica()
@@ -986,11 +1005,7 @@ func (rf *Raft) leaderAppendEntries() {
 				rf.nextIndex[index] = rf.matchIndex[index] + 1
 			} else {
 				if reply.LogInconsistency {
-					if reply.XTerm == -1 {
-						rf.nextIndex[index] = reply.XIndex
-					} else {
-						rf.handleLogInconsistency(index, reply)
-					}
+					rf.handleLogInconsistency(index, reply)
 				}
 			}
 
@@ -1024,6 +1039,9 @@ func (rf *Raft) leaderAppendEntries() {
 func (rf *Raft) handleLogInconsistency(index int, reply *AppendEntriesReply) {
 	if reply.XTerm == -1 {
 		rf.nextIndex[index] = reply.XIndex
+		if rf.nextIndex[index] <= rf.matchIndex[index] {
+			rf.nextIndex[index] = rf.matchIndex[index] + 1
+		}
 	} else {
 		target := reply.XIndex
 		for i := len(rf.Log) - 1; i > 0; i-- {
@@ -1278,6 +1296,9 @@ func (rf *Raft) applyChecker() {
 		// apply log[lastApplied] to state machine (§5.3)
 
 		// commitIndex > lastApplied
+		if lastApplied+1-firstLogIndex < 0 || commitIndex+1-firstLogIndex < 0 {
+			PrettyDebug(dError, "S%d lastIncludedIndex: %d, commitIndex: %d, lastApplied: %d ", rf.me, firstLogIndex, commitIndex, lastApplied)
+		}
 		entries := make([]LogEntry, commitIndex-lastApplied)
 		copy(entries, rf.Log[lastApplied+1-firstLogIndex:commitIndex+1-firstLogIndex])
 		PrettyDebug(dLog, "S%d Apply Entries at %d, commitIndex is %d, Apply Log is %v ", rf.me, rf.lastApplied+1, rf.commitIndex, entries)
