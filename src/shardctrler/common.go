@@ -72,5 +72,27 @@ type QueryReply struct {
 	Config      Config
 }
 
-type Command struct {
+type CommandArgs struct {
+	ArgsType int              // JoinArgs, LeaveArgs, MoveArgs, QueryArgs
+	Servers  map[int][]string // JoinArgs		// new GID -> servers mappings
+	GIDs     []int            // LeaveArgs
+	Shard    int              // MoveArgs
+	GID      int              // MoveArgs
+	Num      int              // QueryArgs 		// desired config number
+	SeqNum   int              // for deduplication
+	ClientID int64            // for deduplication
 }
+
+type CommandReply struct {
+	ReplyType   int    // JoinArgs, LeaveArgs, MoveArgs, QueryArgs
+	WrongLeader bool   // Join, Leave, Move, Query
+	Err         Err    // Join, Leave, Move, Query
+	Config      Config // Query
+}
+
+const (
+	JoinArgsType  = 1
+	LeaveArgsType = 2
+	MoveArgsType  = 3
+	QueryArgsType = 4
+)

@@ -27,12 +27,11 @@ func (paa *PutAppendArgs) String() string {
 }
 
 type PutAppendReply struct {
-	Err        Err
-	LeaderHint int //  address of new Leader, -1 if unkonwn
+	Err Err
 }
 
 func (par *PutAppendReply) String() string {
-	return fmt.Sprintf("PutAppendReply{Err:%s, LeaderHint:%d}", par.Err, par.LeaderHint)
+	return fmt.Sprintf("PutAppendReply{Err:%s}", par.Err)
 }
 
 type GetArgs struct {
@@ -47,11 +46,10 @@ func (ga *GetArgs) String() string {
 }
 
 type GetReply struct {
-	Err        Err
-	Value      string
-	LeaderHint int
+	Err   Err
+	Value string
 }
 
 func (gr *GetReply) String() string {
-	return fmt.Sprintf("GetReply{Err:%s, Value:%s, LeaderHint:%d}", gr.Err, gr.Value, gr.LeaderHint)
+	return fmt.Sprintf("GetReply{Err:%s, Value:%s}", gr.Err, gr.Value)
 }
