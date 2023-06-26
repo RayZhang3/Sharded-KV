@@ -25,6 +25,18 @@ type Op struct {
 	Optype   string
 }
 
+func (op *Op) String() string {
+	switch op.Optype {
+	case "Get":
+		return fmt.Sprintf("Optype: %s, ClientID:%d, SeqNum %d, Key: %s", op.Optype, op.ClientID, op.SeqNum, op.Key)
+	case "Put":
+		return fmt.Sprintf("Optype: %s, ClientID:%d, SeqNum %d, Key: %v, Value: %v", op.Optype, op.ClientID, op.SeqNum, op.Key, op.Value)
+	case "Append":
+		return fmt.Sprintf("Optype: %s, ClientID:%d, SeqNum %d, Key: %v, Value: %v", op.Optype, op.ClientID, op.SeqNum, op.Key, op.Value)
+	}
+	return fmt.Sprintf("Optype: %s, ClientID:%d, SeqNum %d, Key: %v, Value: %v", op.Optype, op.ClientID, op.SeqNum, op.Key, op.Value)
+}
+
 type ShardKV struct {
 	mu           sync.Mutex
 	me           int
@@ -120,7 +132,7 @@ func (kv *ShardKV) applyHandler() {
 				kv.mu.Unlock()
 			} else {
 				op, _ := applyMsg.Command.(Op)
-				// PrettyDebug(dServer, "Server%d get valid command %s", kv.me, op.String())
+				PrettyDebug(dServer, "Server%d get valid command %s", kv.me, op.String())
 				appliedOp := Op{op.ClientID, op.SeqNum, op.Key, op.Value, op.Optype}
 				kv.mu.Lock()
 				// Check if the applyMsg have been applied before
@@ -138,21 +150,21 @@ func (kv *ShardKV) applyHandler() {
 					if appliedOp.Optype == "Get" {
 						appliedOp.Value = kv.currentState[appliedOp.Key]
 					}
-					// PrettyDebug(dServer, "Server%d sequenceNum already processed from client %d, appliedOp: %s, kv.clientSeq: %v",
-					// kv.me, appliedOp.ClientID, appliedOp.String(), kv.clientSeq)
+					PrettyDebug(dServer, "Server%d sequenceNum already processed from client %d, appliedOp: %s, kv.clientSeq: %v",
+						kv.me, appliedOp.ClientID, appliedOp.String(), kv.clientSeq)
 				} else {
 					// If sequenceNum not processed, store response and reply OK
 					if appliedOp.Optype == "Get" {
 						appliedOp.Value = kv.currentState[appliedOp.Key]
 					}
 					kv.applyToStateMachine(&appliedOp)
-					// PrettyDebug(dServer, "Server%d apply command %s, kv.currentState:%v", kv.me, appliedOp.String(), kv.currentState)
+					PrettyDebug(dServer, "Server%d apply command %s, kv.currentState:%v", kv.me, appliedOp.String(), kv.currentState)
 				}
 
 				if kv.maxraftstate != -1 && kv.rf.GetStateSize() > kv.maxraftstate {
 					snapshotData := kv.getServerPersistData()
 					kv.rf.Snapshot(applyMsg.CommandIndex, snapshotData)
-					// PrettyDebug(dPersist, "Server %d store snapshot with commandIndex %d, kv.currentState:%v, kv.clientSeq:%v", kv.me, applyMsg.CommandIndex, kv.currentState, kv.clientSeq)
+					PrettyDebug(dPersist, "Server %d store snapshot with commandIndex %d, kv.currentState:%v, kv.clientSeq:%v", kv.me, applyMsg.CommandIndex, kv.currentState, kv.clientSeq)
 				}
 
 				// If the channel is existing, and the leader is still alive, send the appliedOp to the channel
@@ -211,7 +223,7 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 	}
 	// Append command to log, replicate and commit it
 	op := Op{args.ClientID, args.SeqNum, args.Key, "", "Get"}
-	// PrettyDebug(dServer, "Server%d insert GET command to raft Log, COMMAND %s", kv.me, op.String())
+	PrettyDebug(dServer, "Server%d insert GET command to raft Log, COMMAND %s", kv.me, op.String())
 	index, _, isLeader := kv.rf.Start(op)
 	if !isLeader {
 		reply.Err = ErrWrongLeader
@@ -242,7 +254,7 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 			return
 		}
 
-		// PrettyDebug(dServer, "Server%d receive GET command from raft, COMMAND %s", kv.me, op.String())
+		PrettyDebug(dServer, "Server%d receive GET command from raft, COMMAND %s", kv.me, op.String())
 		if applyOp.SeqNum == args.SeqNum && applyOp.ClientID == args.ClientID {
 			reply.Value = applyOp.Value
 			reply.Err = OK
@@ -288,7 +300,7 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		return
 	}
 
-	//PrettyDebug(dServer, "Server%d insert PUTAPPEND command to raft, COMMAND %s", kv.me, op.String())
+	PrettyDebug(dServer, "Server%d insert PUTAPPEND command to raft, COMMAND %s", kv.me, op.String())
 
 	kv.mu.Lock()
 	waitCh := kv.getWaitCh(index)
@@ -315,7 +327,7 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 			return
 		}
 
-		// PrettyDebug(dServer, "Server%d receive GET command from raft, COMMAND %s", kv.me, op.String())
+		PrettyDebug(dServer, "Server%d receive GET command from raft, COMMAND %s", kv.me, op.String())
 
 		if applyOp.SeqNum == args.SeqNum && applyOp.ClientID == args.ClientID {
 			reply.Err = OK
