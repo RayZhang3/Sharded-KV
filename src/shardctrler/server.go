@@ -96,7 +96,7 @@ func (sc *ShardCtrler) applyHandler() {
 				continue
 			}
 			op, _ := applyMsg.Command.(Op)
-			PrettyDebug(dServer, "Server%d get valid command %s", sc.me, op.String())
+			// PrettyDebug(dServer, "Server%d get valid command %s", sc.me, op.String())
 			appliedOp := Op{op.ArgsType, op.Servers, op.GIDs, op.Shard, op.GID, op.Num, op.SeqNum, op.ClientID}
 
 			// no check for lastIncludedIndex
@@ -162,7 +162,7 @@ func (sc *ShardCtrler) applyToStateMachine(appliedOp *Op) {
 			}
 			copyMap[gid] = values
 		}
-		PrettyDebug(dServer, "Server%d Apply Join, copyMap: %v", sc.me, copyMap)
+		// PrettyDebug(dCtrl, "SHARDCTRLER %d Apply Join, copyMap: %v", sc.me, copyMap)
 		// Rebalance
 		gidToShardsMap := getGIDtoShardsMap(oldShards, copyMap)
 		newShards, _ := rebalance(gidToShardsMap, oldShards, copyMap)
@@ -172,14 +172,14 @@ func (sc *ShardCtrler) applyToStateMachine(appliedOp *Op) {
 	case LeaveArgsType:
 		// GIDs     []int            // LeaveArgs
 		/*
-			PrettyDebug(dServer, "Before Server%d Apply Leave, copyMap: %v, address: %p", sc.me, oldGroups, oldGroups)
-			PrettyDebug(dServer, "appliedOp.GIDs: %v", appliedOp.GIDs)
+			PrettyDebug(dCtrl, "Before Server%d Apply Leave, copyMap: %v, address: %p", sc.me, oldGroups, oldGroups)
+			PrettyDebug(dCtrl, "appliedOp.GIDs: %v", appliedOp.GIDs)
 		*/
 		copyMap := getGroupMapCopy(oldGroups)
 		for _, gid := range appliedOp.GIDs {
 			delete(copyMap, gid)
 		}
-		PrettyDebug(dServer, "Server%d Apply Leave, copyMap: %v, address: %p", sc.me, copyMap, copyMap)
+		// PrettyDebug(dCtrl, "SHARDCTRL Apply Leave, copyMap: %v, address: %p", sc.me, copyMap, copyMap)
 		// Rebalance
 		gidToShardsMap := getGIDtoShardsMap(oldShards, copyMap)
 		newShards, _ := rebalance(gidToShardsMap, oldShards, copyMap)
@@ -199,7 +199,7 @@ func (sc *ShardCtrler) applyToStateMachine(appliedOp *Op) {
 	case QueryArgsType:
 		// Num      int              // QueryArgs
 	default:
-		PrettyDebug(dServer, "Server receive wrong Request: args.ArgsType error")
+		PrettyDebug(dCtrl, "SHARDCTRL receive wrong Request: args.ArgsType error")
 	}
 }
 
@@ -222,7 +222,7 @@ func getGIDtoShardsMap(shards [NShards]int, newMap map[int][]string) map[int][]i
 			gitToShards[gid] = append(gitToShards[gid], shardIndex)
 		}
 	}
-	PrettyDebug(dServer, "GIDtoShardsMap: %v", gitToShards)
+	// PrettyDebug(dCtrl, "SHARDCTRL GIDtoShardsMap: %v", gitToShards)
 	return gitToShards
 }
 
@@ -244,7 +244,7 @@ func rebalance(gitToShards map[int][]int, oldShards [NShards]int, newMap map[int
 		liveGroup = append(liveGroup, key)
 	}
 	sort.Ints(liveGroup)
-	PrettyDebug(dServer, "liveGroup: %v", liveGroup)
+	// PrettyDebug(dServer, "liveGroup: %v", liveGroup)
 	// need to fill the newShards with the existing free shards
 	// Get free Shards first
 	freeShards := make([]int, 0)
@@ -258,7 +258,7 @@ func rebalance(gitToShards map[int][]int, oldShards [NShards]int, newMap map[int
 			freeShards = append(freeShards, shardIndex)
 		}
 	}
-	PrettyDebug(dServer, "freeShards: %v", freeShards)
+	// PrettyDebug(dServer, "freeShards: %v", freeShards)
 	// Rebalance
 	for {
 		maxShards := -1
@@ -295,13 +295,13 @@ func rebalance(gitToShards map[int][]int, oldShards [NShards]int, newMap map[int
 			moveShards[moveShardIndex] = true
 		}
 	}
-	PrettyDebug(dServer, "After rebalanced, GIDtoShardsMap: %v", gitToShards)
+	// PrettyDebug(dCtrl, "After rebalanced, GIDtoShardsMap: %v", gitToShards)
 	for _, gid := range liveGroup {
 		for _, shardsIndex := range gitToShards[gid] {
 			newShards[shardsIndex] = gid
 		}
 	}
-	PrettyDebug(dServer, "Rebalanced newShards: %v, moveShards: %v", newShards, moveShards)
+	PrettyDebug(dCtrl, "Rebalanced newShards: %v, moveShards: %v", newShards, moveShards)
 	return newShards, moveShards
 }
 
@@ -316,15 +316,14 @@ func getGroupMapCopy(originalMap map[int][]string) map[int][]string {
 	return copyMap
 }
 
-/*
-func getShardsCopy(originalShards []int) []int {
-	shardsCopy := make([]int, len(originalShards))
+func getShardsCopy(originalShards [NShards]int) [NShards]int {
+	// shardsCopy := make([]int, len(originalShards))
+	shardsCopy := [NShards]int{}
 	for idx, item := range originalShards {
 		shardsCopy[idx] = item
 	}
 	return shardsCopy
 }
-*/
 
 // get the wait channel for the index, if not exist, create one
 // channel is used to send the appliedOp to the client
@@ -340,18 +339,20 @@ func (sc *ShardCtrler) getWaitCh(index int) (waitCh chan Op) {
 
 func (sc *ShardCtrler) RequestHandler(args *CommandArgs, reply *CommandReply) {
 	// Your code here.
-	switch args.ArgsType {
-	case JoinArgsType:
-		PrettyDebug(dServer, "Server %d receive Join:", sc.me)
-	case LeaveArgsType:
-		PrettyDebug(dServer, "Server %d receive Leave:", sc.me)
-	case MoveArgsType:
-		PrettyDebug(dServer, "Server %d receive Move:", sc.me)
-	case QueryArgsType:
-		PrettyDebug(dServer, "Server %d receive Query:", sc.me)
-	default:
-		PrettyDebug(dServer, "Server receive wrong Request: args.ArgsType error")
-	}
+	/*
+		switch args.ArgsType {
+		case JoinArgsType:
+			PrettyDebug(dServer, "Server %d receive Join:", sc.me)
+		case LeaveArgsType:
+			PrettyDebug(dServer, "Server %d receive Leave:", sc.me)
+		case MoveArgsType:
+			PrettyDebug(dServer, "Server %d receive Move:", sc.me)
+		case QueryArgsType:
+			PrettyDebug(dServer, "Server %d receive Query:", sc.me)
+		default:
+			PrettyDebug(dServer, "Server receive wrong Request: args.ArgsType error")
+		}
+	*/
 	_, isLeader := sc.rf.GetState()
 	// Reply NOT_Leader if not leader, providing hint when available
 	if !isLeader {
@@ -367,7 +368,7 @@ func (sc *ShardCtrler) RequestHandler(args *CommandArgs, reply *CommandReply) {
 		reply.WrongLeader = true
 		return
 	}
-	PrettyDebug(dServer, "Server%d insert command to raft, COMMAND %s", sc.me, op.String())
+	// PrettyDebug(dServer, "Server%d insert command to raft, COMMAND %s", sc.me, op.String())
 
 	sc.mu.Lock()
 	waitCh := sc.getWaitCh(index)
@@ -393,7 +394,9 @@ func (sc *ShardCtrler) RequestHandler(args *CommandArgs, reply *CommandReply) {
 		if applyOp.SeqNum == args.SeqNum && applyOp.ClientID == args.ClientID {
 			if applyOp.ArgsType == QueryArgsType {
 				sc.mu.Lock()
-				reply.Config = sc.getConfig(args.Num)
+				queryConfig := sc.getConfig(args.Num)
+				retConfig := Config{Num: queryConfig.Num, Shards: getShardsCopy(queryConfig.Shards), Groups: getGroupMapCopy(queryConfig.Groups)}
+				reply.Config = retConfig
 				sc.mu.Unlock()
 			}
 			reply.Err = OK

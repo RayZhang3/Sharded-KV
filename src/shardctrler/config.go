@@ -43,6 +43,7 @@ const (
 	dTrace   logTopic = "TRCE"
 	dVote    logTopic = "VOTE"
 	dWarn    logTopic = "WARN"
+	dCtrl    logTopic = "SCTL"
 )
 
 // Retrieve the verbosity level from an environment variable
