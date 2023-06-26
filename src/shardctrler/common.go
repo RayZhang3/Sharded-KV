@@ -1,5 +1,7 @@
 package shardctrler
 
+import "fmt"
+
 //
 // Shard controler: assigns shards to replication groups.
 //
@@ -28,8 +30,13 @@ type Config struct {
 	Groups map[int][]string // gid -> servers[]
 }
 
+func (config *Config) String() string {
+	return fmt.Sprintf("Config: Num: %v, Shards: %v, Groups: %v", config.Num, config.Shards, config.Groups)
+}
+
 const (
-	OK = "OK"
+	OK             = "OK"
+	ErrWrongLeader = "ErrWrongLeader"
 )
 
 type Err string
@@ -83,11 +90,19 @@ type CommandArgs struct {
 	ClientID int64            // for deduplication
 }
 
+func (args *CommandArgs) String() string {
+	return fmt.Sprintf("CommandArgs: ArgsType %v, Servers: %v, GIDs: %v, Shard: %v, GID: %v, Num: %v, SeqNum: %v, ClientID: %v", args.ArgsType, args.Servers, args.GIDs, args.Shard, args.GID, args.Num, args.SeqNum, args.ClientID)
+}
+
 type CommandReply struct {
 	ReplyType   int    // JoinArgs, LeaveArgs, MoveArgs, QueryArgs
 	WrongLeader bool   // Join, Leave, Move, Query
 	Err         Err    // Join, Leave, Move, Query
 	Config      Config // Query
+}
+
+func (reply *CommandReply) String() string {
+	return fmt.Sprintf("CommandReply: ReplyType %v, WrongLeader: %v, Err: %v, Config: %v", reply.ReplyType, reply.WrongLeader, reply.Err, reply.Config)
 }
 
 const (

@@ -74,13 +74,13 @@ func (ck *Clerk) Request(args *CommandArgs) *CommandReply {
 			reply := &CommandReply{}
 			switch args.ArgsType {
 			case JoinArgsType:
-				PrettyDebug(dClient, "Clerk%d send Join:", ck.clientID)
+				PrettyDebug(dClient, "Clerk%d send Join, SeqNum: %d", ck.clientID, ck.seqNum)
 			case LeaveArgsType:
-				PrettyDebug(dClient, "Clerk%d send Leave:", ck.clientID)
+				PrettyDebug(dClient, "Clerk%d send Leave, SeqNum: %d", ck.clientID, ck.seqNum)
 			case MoveArgsType:
-				PrettyDebug(dClient, "Clerk%d send Move:", ck.clientID)
+				PrettyDebug(dClient, "Clerk%d send Move, SeqNum: %d", ck.clientID, ck.seqNum)
 			case QueryArgsType:
-				PrettyDebug(dClient, "Clerk%d send Query:", ck.clientID)
+				PrettyDebug(dClient, "Clerk%d send Query, SeqNum: %d", ck.clientID, ck.seqNum)
 			default:
 				PrettyDebug(dClient, "Clerk%d Request: args.ArgsType error", ck.clientID)
 			}
@@ -88,6 +88,7 @@ func (ck *Clerk) Request(args *CommandArgs) *CommandReply {
 			ok := srv.Call("ShardCtrler.RequestHandler", args, reply)
 			if ok && reply.WrongLeader == false {
 				ck.seqNum++
+				PrettyDebug(dClient, "Clerk%d receive reply: %s", ck.clientID, reply.String())
 				return reply
 			}
 		}
