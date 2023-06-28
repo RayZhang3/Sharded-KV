@@ -352,10 +352,9 @@ type ShardKV struct {
 	lastIncludedIndex int // for snapshot
 
 	// Lab 4B
-	mck        *shardctrler.Clerk
-	config     shardctrler.Config
-	prevConfig shardctrler.Config
-
+	mck         *shardctrler.Clerk
+	config      shardctrler.Config
+	prevConfig  shardctrler.Config
 	shardsState [shardctrler.NShards]int
 }
 
