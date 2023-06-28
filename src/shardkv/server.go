@@ -431,6 +431,10 @@ func (kv *ShardKV) getServerPersistData() []byte {
 	e := labgob.NewEncoder(w)
 	e.Encode(kv.currentState)
 	e.Encode(kv.clientSeq)
+	// Lab 4
+	e.Encode(kv.shardsState)
+	e.Encode(kv.config)
+	e.Encode(kv.prevConfig)
 	data := w.Bytes()
 	return data
 }
@@ -443,11 +447,18 @@ func (kv *ShardKV) readServerPersistData(data []byte) {
 	d := labgob.NewDecoder(r)
 	var currentState map[string]string
 	var clientSeq map[int64]int
-	if d.Decode(&currentState) != nil || d.Decode(&clientSeq) != nil {
+	var shardsState [shardctrler.NShards]int
+	var config shardctrler.Config
+	var prevConfig shardctrler.Config
+	if d.Decode(&currentState) != nil || d.Decode(&clientSeq) != nil || d.Decode(&shardsState) != nil ||
+		d.Decode(&config) != nil || d.Decode(&prevConfig) != nil {
 		return
 	} else {
 		kv.currentState = currentState
 		kv.clientSeq = clientSeq
+		kv.shardsState = shardsState
+		kv.config = config
+		kv.prevConfig = prevConfig
 	}
 }
 
@@ -558,6 +569,13 @@ func (kv *ShardKV) applyHandler() {
 
 					if kv.shardsState[shardConfirmMsg.ShardIndex] == BEPULLED {
 						kv.shardsState[shardConfirmMsg.ShardIndex] = NO_SERVING
+						//
+						for key, _ := range kv.currentState {
+							if key2shard(key) == shardConfirmMsg.ShardIndex {
+								delete(kv.currentState, key)
+							}
+						}
+						//
 						PrettyDebug(dServer, "KVServer %d-%d APPLY HANDLER get ShardConfirmMsg %s", kv.gid, kv.me, shardConfirmMsg.String())
 					}
 					msg = CommandMsg{CommandType: ShardConfirmOperation, Data: shardConfirmMsg}
@@ -854,6 +872,8 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	if len(snapshot) > 0 {
 		kv.mu.Lock()
 		kv.readServerPersistData(snapshot)
+		PrettyDebug(dServer, "KVServer%d-%d read snapshot from raft, shardsState %v, config.Num: %d, prevConfig.Num: %d, currentState %v, clientSeq %v",
+			kv.gid, kv.me, kv.shardsState, kv.config.Num, kv.prevConfig.Num, kv.currentState, kv.clientSeq)
 		kv.mu.Unlock()
 	}
 	go kv.applyHandler()
