@@ -153,8 +153,8 @@ func (sc *ShardCtrler) applyToStateMachine(appliedOp *Op) {
 	case JoinArgsType:
 		// Servers  map[int][]string // JoinArgs
 		//PrettyDebug(dServer, "Before Server%d Apply Join, copyMap: %v", sc.me, oldGroups)
-		copyMap := getGroupMapCopy(oldGroups)
-		copyNewServer := getGroupMapCopy(appliedOp.Servers)
+		copyMap := GetGroupMapCopy(oldGroups)
+		copyNewServer := GetGroupMapCopy(appliedOp.Servers)
 		for gid, values := range copyNewServer {
 			_, isPresent := copyMap[gid]
 			if isPresent {
@@ -175,7 +175,7 @@ func (sc *ShardCtrler) applyToStateMachine(appliedOp *Op) {
 			PrettyDebug(dCtrl, "Before Server%d Apply Leave, copyMap: %v, address: %p", sc.me, oldGroups, oldGroups)
 			PrettyDebug(dCtrl, "appliedOp.GIDs: %v", appliedOp.GIDs)
 		*/
-		copyMap := getGroupMapCopy(oldGroups)
+		copyMap := GetGroupMapCopy(oldGroups)
 		for _, gid := range appliedOp.GIDs {
 			delete(copyMap, gid)
 		}
@@ -306,7 +306,7 @@ func rebalance(gitToShards map[int][]int, oldShards [NShards]int, newMap map[int
 }
 
 // Groups map[int][]string // gid -> servers[]
-func getGroupMapCopy(originalMap map[int][]string) map[int][]string {
+func GetGroupMapCopy(originalMap map[int][]string) map[int][]string {
 	copyMap := make(map[int][]string)
 	for key, value := range originalMap {
 		valueCopy := make([]string, len(value))
@@ -316,7 +316,7 @@ func getGroupMapCopy(originalMap map[int][]string) map[int][]string {
 	return copyMap
 }
 
-func getShardsCopy(originalShards [NShards]int) [NShards]int {
+func GetShardsCopy(originalShards [NShards]int) [NShards]int {
 	// shardsCopy := make([]int, len(originalShards))
 	shardsCopy := [NShards]int{}
 	for idx, item := range originalShards {
@@ -395,7 +395,7 @@ func (sc *ShardCtrler) RequestHandler(args *CommandArgs, reply *CommandReply) {
 			if applyOp.ArgsType == QueryArgsType {
 				sc.mu.Lock()
 				queryConfig := sc.getConfig(args.Num)
-				retConfig := Config{Num: queryConfig.Num, Shards: getShardsCopy(queryConfig.Shards), Groups: getGroupMapCopy(queryConfig.Groups)}
+				retConfig := Config{Num: queryConfig.Num, Shards: GetShardsCopy(queryConfig.Shards), Groups: GetGroupMapCopy(queryConfig.Groups)}
 				reply.Config = retConfig
 				sc.mu.Unlock()
 			}

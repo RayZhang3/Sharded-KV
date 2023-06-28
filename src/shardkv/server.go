@@ -26,13 +26,38 @@ type Op struct {
 }
 
 const (
-	KVOperation     = 1
-	ConfigOperation = 2
+	KVOperation           = 1
+	ConfigOperation       = 2
+	ShardRequestOperation = 3
+	ShardConfirmOperation = 4
 )
 
 type CommandMsg struct {
 	CommandType int
 	Data        interface{}
+}
+
+type ShardRequestMsg struct {
+	ConfigNum  int
+	ShardIndex int
+	GID        int
+	ShardData  map[string]string
+	// SeqNum
+	ClientSeqNum map[int64]int
+}
+
+func (shardRequestMsg *ShardRequestMsg) String() string {
+	return fmt.Sprintf("ShardRequestMsg: ConfigNum: %d, ShardIndex: %d, GID: %d, ShardData: %v", shardRequestMsg.ConfigNum, shardRequestMsg.ShardIndex, shardRequestMsg.GID, shardRequestMsg.ShardData)
+}
+
+type ShardConfirmMsg struct {
+	ConfigNum  int
+	ShardIndex int
+	ShardState int
+}
+
+func (shardConfirmMsg *ShardConfirmMsg) String() string {
+	return fmt.Sprintf("ShardConfirmMsg: ConfigNum: %d, ShardIndex: %d, ShardState: %d", shardConfirmMsg.ConfigNum, shardConfirmMsg.ShardIndex, shardConfirmMsg.ShardState)
 }
 
 func (commandMsg *CommandMsg) String() string {
@@ -41,8 +66,239 @@ func (commandMsg *CommandMsg) String() string {
 		return fmt.Sprintf("CommandMsg: CommandType: %s, Data: %v", "KVOperation", commandMsg.Data)
 	case ConfigOperation:
 		return fmt.Sprintf("CommandMsg: CommandType: %s, Data: %v", "ConfigOperation", commandMsg.Data)
+	case ShardRequestOperation:
+		return fmt.Sprintf("CommandMsg: CommandType: %s, Data: %v", "ShardRequestOperation", commandMsg.Data)
+	case ShardConfirmOperation:
+		return fmt.Sprintf("CommandMsg: CommandType: %s, Data: %v", "ShardConfirmOperation", commandMsg.Data)
 	}
+
 	return fmt.Sprintf("CommandMsg: CommandType: %s, Data: %v", "Unknown", commandMsg.Data)
+}
+
+// RPC between Servers.
+type ShardRequestArgs struct {
+	ConfigNum  int
+	ShardIndex int
+	GID        int
+}
+
+func (args *ShardRequestArgs) String() string {
+	return fmt.Sprintf("ShardRequestArgs: ConfigNum: %d, ShardIndex: %d, GID: %d", args.ConfigNum, args.ShardIndex, args.GID)
+}
+
+type ShardRequestReply struct {
+	Err        Err
+	ConfigNum  int
+	ShardIndex int
+	ShardData  map[string]string
+	// SeqNum
+	ClientSeqNum map[int64]int
+}
+
+func (reply *ShardRequestReply) String() string {
+	return fmt.Sprintf("ShardRequestReply: Err: %s, ConfigNum: %d, ShardIndex: %d, ShardData: %v", reply.Err, reply.ConfigNum, reply.ShardIndex, reply.ShardData)
+}
+
+type ShardConfirmArgs struct {
+	ConfigNum  int
+	ShardIndex int
+}
+
+func (args *ShardConfirmArgs) String() string {
+	return fmt.Sprintf("ShardConfirmArgs: ConfigNum: %d, ShardIndex: %d", args.ConfigNum, args.ShardIndex)
+}
+
+type ShardConfirmReply struct {
+	Err        Err
+	ConfigNum  int
+	ShardIndex int
+	ShardState int
+}
+
+func (reply *ShardConfirmReply) String() string {
+	return fmt.Sprintf("ShardConfirmReply: Err: %s, ConfigNum: %d, ShardState: %d", reply.Err, reply.ConfigNum, reply.ShardState)
+}
+
+func (kv *ShardKV) ShardsRequester() {
+	for !kv.killed() {
+		_, isLeader := kv.rf.GetState()
+		if !isLeader {
+			time.Sleep(100 * time.Millisecond)
+			continue
+		}
+		kv.mu.Lock()
+		pullingShards := make([]int, 0)
+		for index := 0; index < shardctrler.NShards; index++ {
+			if kv.shardsState[index] == PULLING {
+				pullingShards = append(pullingShards, index)
+			}
+		}
+		PrettyDebug(dInfo, "KVServer %d-%d ShardsRequester: pullingShards: %v, Shards:%v", kv.gid, kv.me, pullingShards, kv.config.Shards)
+
+		// BUG: need to use prevConfig to locate the shards.
+		serversCopy := shardctrler.GetGroupMapCopy(kv.prevConfig.Groups)
+		shardsCopy := shardctrler.GetShardsCopy(kv.prevConfig.Shards)
+		kv.mu.Unlock()
+
+		for _, i := range pullingShards {
+			targetGID := shardsCopy[i]
+			servers, ok := serversCopy[targetGID]
+			shardIndex := i
+			args := ShardRequestArgs{kv.config.Num, shardIndex, kv.gid}
+			PrettyDebug(dInfo, "KVServer %d-%d send to GID: %d ShardRequestArgs: %s", kv.gid, kv.me, targetGID, args.String())
+			if !ok {
+				continue
+			}
+			go func(shardIndex int) {
+				for si := 0; si < len(servers); si++ {
+					srv := kv.make_end(servers[si])
+					var reply ShardRequestReply
+					ok := srv.Call("ShardKV.ShardsRequestHandler", &args, &reply)
+					kv.mu.Lock()
+					if ok && reply.Err == OK && reply.ConfigNum == kv.config.Num {
+						if reply.ShardIndex != shardIndex {
+							panic("reply.ShardIndex != shardIndex")
+						}
+						shardRequestMsg := ShardRequestMsg{args.ConfigNum, args.ShardIndex, args.GID, reply.ShardData, reply.ClientSeqNum}
+						msg := CommandMsg{ShardRequestOperation, shardRequestMsg}
+
+						kv.mu.Unlock()
+						_, _, _ = kv.rf.Start(msg)
+						return
+					}
+					kv.mu.Unlock()
+				}
+			}(i)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+func (kv *ShardKV) ShardsRequestHandler(args *ShardRequestArgs, reply *ShardRequestReply) {
+	_, isLeader := kv.rf.GetState()
+	if !isLeader {
+		reply.Err = ErrWrongLeader
+	}
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	if args.ConfigNum != kv.config.Num {
+		PrettyDebug(dError, "KVServer %d-%d ShardsRequestHandler receive WRONG ShardRequestArgs %s", kv.gid, kv.me, args.String())
+		reply.Err = ErrConfig
+		return
+	}
+	// copy the shard data
+	if kv.shardsState[args.ShardIndex] == BEPULLED {
+		reply.Err = OK
+		reply.ConfigNum = args.ConfigNum
+		reply.ShardIndex = args.ShardIndex
+
+		reply.ShardData = make(map[string]string, 0)
+		for key, value := range kv.currentState {
+			if key2shard(key) == args.ShardIndex {
+				reply.ShardData[key] = value
+			}
+		}
+		reply.ClientSeqNum = make(map[int64]int, 0)
+		for key, value := range kv.clientSeq {
+			reply.ClientSeqNum[key] = value
+		}
+		PrettyDebug(dServer, "KVServer %d-%d ShardsRequestHandler reply ShardRequestArgs %s", kv.gid, kv.me, reply.String())
+		return
+	}
+	reply.Err = ErrWrongGroup
+	return
+}
+
+func (kv *ShardKV) ShardsConfirmHandler(args *ShardConfirmArgs, reply *ShardConfirmReply) {
+	_, isLeader := kv.rf.GetState()
+	if !isLeader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
+	if kv.config.Num < args.ConfigNum {
+		reply.Err = ErrConfig
+		PrettyDebug(dError, "KVServer %d-%d ShardsConfirmHandler receive WRONG ShardConfirmArgs %s", kv.gid, kv.me, args.String())
+		return
+	}
+
+	if (kv.config.Num == args.ConfigNum && kv.shardsState[args.ShardIndex] == SERVING) || kv.config.Num > args.ConfigNum {
+		reply.Err = OK
+		reply.ConfigNum = kv.config.Num
+		reply.ShardIndex = args.ShardIndex
+		reply.ShardState = SERVING
+		PrettyDebug(dServer, "KVServer %d-%d ShardsConfirmHandler reply ShardConfirmReply %s", kv.gid, kv.me, reply.String())
+		return
+	}
+	reply.Err = ErrWrongLeader
+}
+
+// Locked
+func (kv *ShardKV) mergeShardData(shardIndex int, shardData map[string]string) {
+	for key, value := range shardData {
+		kv.currentState[key] = value
+	}
+	kv.shardsState[shardIndex] = SERVING
+	PrettyDebug(dServer, "KVServer %d-%d mergeShardIndex %d, kv.currentState:%v", kv.gid, kv.me, shardIndex, kv.shardsState)
+}
+
+func (kv *ShardKV) mergeClientSeqNum(clientSeqNum map[int64]int) {
+	for key, value := range clientSeqNum {
+		if kv.clientSeq[key] < value {
+			kv.clientSeq[key] = value
+		}
+	}
+}
+func (kv *ShardKV) ShardsConfirm() {
+	for !kv.killed() {
+		_, isLeader := kv.rf.GetState()
+		if !isLeader {
+			time.Sleep(100 * time.Millisecond)
+			continue
+		}
+		kv.mu.Lock()
+		bePulledShards := make([]int, 0)
+		for index := 0; index < shardctrler.NShards; index++ {
+			if kv.shardsState[index] == BEPULLED {
+				bePulledShards = append(bePulledShards, index)
+			}
+		}
+		serversCopy := shardctrler.GetGroupMapCopy(kv.config.Groups)
+		shardsCopy := shardctrler.GetShardsCopy(kv.config.Shards)
+		kv.mu.Unlock()
+
+		PrettyDebug(dServer, "KVServer %d-%d ShardsConfirm bePulledShards:%v", kv.gid, kv.me, bePulledShards)
+		for _, i := range bePulledShards {
+			targetGID := shardsCopy[i]
+			servers, ok := serversCopy[targetGID]
+			shardIndex := i
+			args := ShardConfirmArgs{kv.config.Num, shardIndex}
+			if !ok {
+				continue
+			}
+			go func(shardIndex int) {
+				for si := 0; si < len(servers); si++ {
+					srv := kv.make_end(servers[si])
+					var reply ShardConfirmReply
+					PrettyDebug(dInfo, "KVServer %d-%d send to GID: %d ShardConfirm: %s", kv.gid, kv.me, targetGID, args.String())
+					ok := srv.Call("ShardKV.ShardsConfirmHandler", &args, &reply)
+					kv.mu.Lock()
+					if ok && reply.Err == OK && reply.ConfigNum >= kv.config.Num {
+						shardConfirmMsg := ShardConfirmMsg{ConfigNum: args.ConfigNum, ShardIndex: args.ShardIndex, ShardState: reply.ShardState}
+						msg := CommandMsg{ShardConfirmOperation, shardConfirmMsg}
+						kv.mu.Unlock()
+						_, _, _ = kv.rf.Start(msg)
+						return
+					}
+					kv.mu.Unlock()
+				}
+			}(shardIndex)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
 }
 
 /*
@@ -99,8 +355,17 @@ type ShardKV struct {
 	mck        *shardctrler.Clerk
 	config     shardctrler.Config
 	prevConfig shardctrler.Config
-	chanConfig chan Op // receive by getLastConfig(), If apply current config(with all shards serves), send prev config num to chanConfig
+
+	shardsState [shardctrler.NShards]int
 }
+
+const (
+	SERVING    = 1
+	NO_SERVING = 2
+	PULLING    = 3
+	BEPULLED   = 4
+	GCING      = 5
+)
 
 // 1.Check if there's new config. If not, sleep for 100ms
 // 2.If there's new config,
@@ -117,78 +382,38 @@ func (kv *ShardKV) getLastConfig() {
 		}
 		newConfig := kv.mck.Query(-1)
 		kv.mu.Lock()
+		allShardsReady := kv.shardsStateReady()
 		needToUpdate := kv.config.Num < newConfig.Num
+		target := kv.config.Num + 1
+		if kv.config.Num == 0 {
+			allShardsReady = true
+		}
 		PrettyDebug(dServer, "KVServer %d-%d needToUpdate: %v, kv.config.Num: %d, newConfig.Num: %d\n", kv.gid, kv.me, needToUpdate, kv.config.Num, newConfig.Num)
 		kv.mu.Unlock()
-		if !needToUpdate || !isLeader {
+		_, isLeader = kv.rf.GetState()
+		if !needToUpdate || !allShardsReady || !isLeader {
 			time.Sleep(100 * time.Millisecond)
 			continue
 		}
 		// Need to update, put the config into raft
-		// Wait for the new config to be applied (Commit by raft)
+		newConfig = kv.mck.Query(target)
+		// The new config maybe applied (Commit by raft)
 		configCommmand := ConfigMsg{Num: newConfig.Num, Shards: newConfig.Shards, Groups: newConfig.Groups}
 		msg := CommandMsg{ConfigOperation, configCommmand}
-
-		// Loop until the new config is committed by raft, and set the shard state
-		for !kv.killed() {
-			index, _, isLeader := kv.rf.Start(msg)
-			PrettyDebug(dServer, "KVServer %d-%d insert new config to raft %s\n", kv.gid, kv.me, configCommmand.String())
-			// If not leader, break the loop
-			if !isLeader {
-				break
-			}
-			kv.mu.Lock()
-			if kv.config.Num >= newConfig.Num {
-				kv.mu.Unlock()
-				break
-			}
-			waitChan := kv.getWaitCh(index)
-			kv.mu.Unlock()
-			// wait for reply
-			select {
-			case <-time.After(1e9): //7e8
-				// Time out, Append the configCommand to log again.
-				PrettyDebug(dServer, "KVServer %d-%d insert config and %s time out\n", kv.gid, kv.me, configCommmand.String())
-				go func() {
-					kv.mu.Lock()
-					close(waitChan)
-					delete(kv.waitChan, index)
-					kv.mu.Unlock()
-				}()
-				continue
-			case commandMsg := <-waitChan:
-				go func() {
-					kv.mu.Lock()
-					close(waitChan)
-					delete(kv.waitChan, index)
-					kv.mu.Unlock()
-				}()
-				if commandMsg.CommandType != ConfigOperation {
-					break
-				}
-				PrettyDebug(dInfo, "KVServer %d-%d receive config ApplyHandler %s\n", kv.gid, kv.me, commandMsg.String())
-				appliedConfig := commandMsg.Data.(ConfigMsg)
-				if appliedConfig.Num < newConfig.Num {
-					continue
-				}
-				if newConfig.Num == 0 || appliedConfig.Num == newConfig.Num {
-					kv.mu.Lock()
-					/*
-						kv.prevConfig = kv.config
-						kv.config = newConfig
-					*/
-					// need to update the state of the shards.
-					PrettyDebug(dServer, "KVServer %d-%d receive new config from raft %s\n", kv.gid, kv.me, kv.config.String())
-					kv.mu.Unlock()
-					break
-				}
-
-			} // end of select
-			// TODO: wait for the shards to change their state.
-		} // The shards state is updated.
+		_, _, isLeader = kv.rf.Start(msg)
+		PrettyDebug(dServer, "KVServer %d-%d insert new config to raft %s\n", kv.gid, kv.me, configCommmand.String())
 	}
 }
 
+func (kv *ShardKV) shardsStateReady() bool {
+	for i := 0; i < len(kv.shardsState); i++ {
+		if kv.shardsState[i] != NO_SERVING && kv.shardsState[i] != SERVING {
+			PrettyDebug(dServer, "KVServer %d-%d shard %d is not ready, ShardsState:%v", kv.gid, kv.me, i, kv.shardsState)
+			return false
+		}
+	}
+	return true
+}
 func (kv *ShardKV) isWrongGroup(shardIndex int) bool {
 	kv.mu.Lock()
 	/*
@@ -259,6 +484,12 @@ func (kv *ShardKV) applyHandler() {
 						kv.mu.Unlock()
 						continue
 					}
+					// Check if the shard is serving
+					shardIndex := key2shard(op.Key)
+					if kv.shardsState[shardIndex] != SERVING {
+						kv.mu.Unlock()
+						continue
+					}
 					// Check if the client session is existing, if not, init one with 0
 					_, clientIsPresent := kv.clientSeq[appliedOp.ClientID]
 					if !clientIsPresent {
@@ -288,19 +519,55 @@ func (kv *ShardKV) applyHandler() {
 						continue
 					}
 					if kv.config.Num == 0 || applyConfig.Num == kv.config.Num+1 {
-						PrettyDebug(dServer, "KVServer %d-%d UPDATE CONFIG handler get Config %s, kv.config:%v, kv.prevConfig:%v", kv.gid, kv.me, applyConfig.String(), kv.config, kv.prevConfig)
+						PrettyDebug(dServer, "KVServer %d-%d UPDATECONFIG handler get Config %s, kv.config:%v, kv.prevConfig:%v", kv.gid, kv.me, applyConfig.String(), kv.config, kv.prevConfig)
 						kv.prevConfig = kv.config
 						kv.config = shardctrler.Config{applyConfig.Num, applyConfig.Shards, applyConfig.Groups}
+						kv.updateShardsState()
+						PrettyDebug(dServer, "KVServer %d-%d updateShardsState %v", kv.gid, kv.me, kv.shardsState)
 						// update the state of shards.
 					}
 					msg = applyMsg.Command.(CommandMsg)
+
+				case ShardRequestOperation:
+					shardRequestMsg := commandMsg.Data.(ShardRequestMsg)
+					PrettyDebug(dServer, "KVServer %d-%d APPLY HANDLER get ShardRequestMsg %s", kv.gid, kv.me, shardRequestMsg.String())
+					if shardRequestMsg.ConfigNum != kv.config.Num {
+						PrettyDebug(dServer, "KVServer %d-%d WRONG CONFIG ShardRequestMsg %s", kv.gid, kv.me, shardRequestMsg.String())
+						kv.mu.Unlock()
+						continue
+					}
+
+					if kv.shardsState[shardRequestMsg.ShardIndex] == PULLING {
+						kv.mergeShardData(shardRequestMsg.ShardIndex, shardRequestMsg.ShardData)
+						kv.mergeClientSeqNum(shardRequestMsg.ClientSeqNum)
+						// kv.shardsState[shardRequestMsg.Shard] = SERVING
+						PrettyDebug(dServer, "KVServer %d-%d APPLY HANDLER get ShardRequestMsg %s", kv.gid, kv.me, shardRequestMsg.String())
+					} else {
+						PrettyDebug(dServer, "KVServer %d-%d SERVING STATE ShardRequestMsg %s", kv.gid, kv.me, shardRequestMsg.String())
+					}
+					msg = CommandMsg{CommandType: ShardRequestOperation, Data: shardRequestMsg}
+
+				case ShardConfirmOperation:
+					shardConfirmMsg := commandMsg.Data.(ShardConfirmMsg)
+					PrettyDebug(dServer, "KVServer %d-%d APPLY HANDLER get ShardConfirmMsg %s", kv.gid, kv.me, shardConfirmMsg.String())
+					if shardConfirmMsg.ConfigNum != kv.config.Num {
+						PrettyDebug(dServer, "KVServer %d-%d WRONG CONFIG ShardConfirmMsg %s", kv.gid, kv.me, shardConfirmMsg.String())
+						kv.mu.Unlock()
+						continue
+					}
+
+					if kv.shardsState[shardConfirmMsg.ShardIndex] == BEPULLED {
+						kv.shardsState[shardConfirmMsg.ShardIndex] = NO_SERVING
+						PrettyDebug(dServer, "KVServer %d-%d APPLY HANDLER get ShardConfirmMsg %s", kv.gid, kv.me, shardConfirmMsg.String())
+					}
+					msg = CommandMsg{CommandType: ShardConfirmOperation, Data: shardConfirmMsg}
+					PrettyDebug(dServer, "KVServer %d-%d REJECT ShardConfirmMsg %s", kv.gid, kv.me, shardConfirmMsg.String())
 
 				default:
 					panic("Unknown command type")
 				}
 
 				// take snapshot and send msg
-
 				if kv.maxraftstate != -1 && kv.rf.GetStateSize() > kv.maxraftstate {
 					snapshotData := kv.getServerPersistData()
 					kv.rf.Snapshot(applyMsg.CommandIndex, snapshotData)
@@ -322,6 +589,28 @@ func (kv *ShardKV) applyHandler() {
 				}
 
 			}
+		}
+	}
+}
+
+func (kv *ShardKV) updateShardsState() {
+	if kv.prevConfig.Num == 0 {
+		for i := 0; i < shardctrler.NShards; i++ {
+			if kv.config.Shards[i] == kv.gid {
+				kv.shardsState[i] = SERVING
+			}
+		}
+		return
+	}
+	for i := 0; i < shardctrler.NShards; i++ {
+		if kv.prevConfig.Shards[i] == kv.gid && kv.config.Shards[i] == kv.gid {
+			kv.shardsState[i] = SERVING
+		} else if kv.prevConfig.Shards[i] != kv.gid && kv.config.Shards[i] == kv.gid {
+			kv.shardsState[i] = PULLING
+		} else if kv.prevConfig.Shards[i] == kv.gid && kv.config.Shards[i] != kv.gid {
+			kv.shardsState[i] = BEPULLED
+		} else {
+			kv.shardsState[i] = NO_SERVING
 		}
 	}
 }
@@ -532,6 +821,8 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	labgob.Register(Op{})
 	labgob.Register(CommandMsg{})
 	labgob.Register(ConfigMsg{})
+	labgob.Register(ShardRequestMsg{})
+	labgob.Register(ShardConfirmMsg{})
 
 	kv := new(ShardKV)
 	kv.me = me
@@ -551,6 +842,13 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
+	kv.config = shardctrler.Config{}
+	kv.prevConfig = shardctrler.Config{}
+	kv.shardsState = [shardctrler.NShards]int{}
+	for i := 0; i < shardctrler.NShards; i++ {
+		kv.shardsState[i] = NO_SERVING
+	}
+
 	// Your code here.
 	snapshot := kv.rf.GetSnapshot()
 	if len(snapshot) > 0 {
@@ -558,10 +856,9 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 		kv.readServerPersistData(snapshot)
 		kv.mu.Unlock()
 	}
-	kv.config = shardctrler.Config{}
-	kv.prevConfig = shardctrler.Config{}
-
-	go kv.getLastConfig()
 	go kv.applyHandler()
+	go kv.getLastConfig()
+	go kv.ShardsRequester()
+	go kv.ShardsConfirm()
 	return kv
 }
