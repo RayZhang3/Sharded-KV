@@ -459,7 +459,7 @@ func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int,
 	// Trim log
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	// if lastIncludedIndex <= rf.commitIndex || lastIncludedIndex <= rf.lastIncludedIndex {
+
 	if lastIncludedIndex <= rf.commitIndex {
 		return false
 	}
@@ -1070,70 +1070,53 @@ func (rf *Raft) handleLogInconsistency(index int, reply *AppendEntriesReply) {
 }
 
 func (rf *Raft) candidateRequestVote() {
-
+	args := &RequestVoteArgs{
+		Term:         rf.currentTerm,
+		CandidateId:  rf.me,
+		LastLogIndex: rf.getLastLogIndex(),
+		LastLogTerm:  rf.getLastLogTerm(),
+	}
+	rfState := rf.state
+	rf.mu.Unlock()
+	if rf.killed() && rfState != CANDIDATE {
+		return
+	}
 	for i := 0; i < len(rf.peers); i++ {
 		if i == rf.me {
 			continue
 		}
-		rf.mu.Lock()
-		if rf.killed() && rf.state != CANDIDATE {
-			return
-		}
-		rf.mu.Unlock()
+		reply := &RequestVoteReply{}
 		go func(index int) {
-			rf.mu.Lock()
-			args := &RequestVoteArgs{
-				Term:         rf.currentTerm,
-				CandidateId:  rf.me,
-				LastLogIndex: rf.getLastLogIndex(),
-				LastLogTerm:  rf.getLastLogTerm(),
-			}
-
-			reply := &RequestVoteReply{}
-			requestSuccess := false
-			for !rf.killed() && !requestSuccess && rf.state == CANDIDATE && rf.currentTerm == args.Term {
-				rf.mu.Unlock()
-				requestSuccess = rf.sendRequestVote(index, args, reply)
-				if !requestSuccess {
-					//PrettyDebug(dVote, "S%d RequestVote error", args.CandidateId)
+			retry := 0
+			ok := false
+			for !rf.killed() && retry <= 3 && !ok {
+				ok = rf.sendRequestVote(index, args, reply)
+				if !ok {
+					retry++
 					time.Sleep(2e8)
-				}
-				rf.mu.Lock()
-				if reply.Term > rf.currentTerm {
-					rf.FollowerState(reply.Term)
-					rf.mu.Unlock()
-					return
+					continue
 				}
 			}
-			if !requestSuccess {
-				rf.mu.Unlock()
+			// If RPC request or response contains termT > currentTerm: set currentTerm = T, convert to follower
+			if !ok {
 				return
 			}
-
-			// If RPC request or response contains termT > currentTerm: set currentTerm = T, convert to follower
+			rf.mu.Lock()
+			defer rf.mu.Unlock()
 			if reply.Term > rf.currentTerm {
 				rf.FollowerState(reply.Term)
-				rf.mu.Unlock()
 				return
 			}
-
 			if rf.state != CANDIDATE || rf.currentTerm != args.Term {
-				rf.mu.Unlock()
 				return
 			}
-
 			// PrettyDebug(dVote, "S%d currentTerm is %d, receiveTerm is %d", rf.me, rf.currentTerm, reply.Term)
-
-			if reply.Term == rf.currentTerm && rf.state == CANDIDATE {
-				if reply.VoteGranted {
-					rf.getVotesNum += 1
-					if rf.getVotesNum > len(rf.peers)/2 {
-						rf.LeaderState()
-						//PrettyDebug(dVote, "S%d becomes LEADER, has votes %d", rf.me, rf.getVotesNum)
-					}
+			if reply.Term == rf.currentTerm && rf.state == CANDIDATE && reply.VoteGranted {
+				rf.getVotesNum += 1
+				if rf.getVotesNum > len(rf.peers)/2 {
+					rf.LeaderState()
 				}
 			}
-			rf.mu.Unlock()
 		}(i)
 	}
 }
@@ -1258,7 +1241,6 @@ func (rf *Raft) ticker() {
 				time.Sleep(10 * time.Millisecond)
 				continue
 			}
-			rf.CandidateState()
 
 			randNum = int64(1000 + rand.Intn(500)) //1-1.5s
 			randTime = randNum * 1000000
@@ -1268,8 +1250,7 @@ func (rf *Raft) ticker() {
 			// reset timer
 			rf.lastTimeHeared = currentTime
 			//PrettyDebug(dVote, "S%d request for vote", rf.me)
-
-			rf.mu.Unlock()
+			rf.CandidateState()
 			rf.candidateRequestVote()
 		}
 		time.Sleep(10 * time.Millisecond)

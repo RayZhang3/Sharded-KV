@@ -117,7 +117,7 @@ type ShardConfirmReply struct {
 }
 
 func (reply *ShardConfirmReply) String() string {
-	return fmt.Sprintf("ShardConfirmReply: Err: %s, ConfigNum: %d, ShardState: %d", reply.Err, reply.ConfigNum, reply.ShardState)
+	return fmt.Sprintf("ShardConfirmReply: Err: %s, ConfigNum: %d, ShardIndex: %d, ShardState: %d", reply.Err, reply.ConfigNum, reply.ShardIndex, reply.ShardState)
 }
 
 func (kv *ShardKV) RaftLogChecker() {
@@ -128,9 +128,10 @@ func (kv *ShardKV) RaftLogChecker() {
 			commandMsg := CommandMsg{NoOperation, nil}
 			kv.rf.Start(commandMsg)
 		}
-		time.Sleep(100 * time.Millisecond)
+		time.Sleep(1000 * time.Millisecond)
 	}
 }
+
 func (kv *ShardKV) ShardsRequester() {
 	for !kv.killed() {
 		_, isLeader := kv.rf.GetState()
@@ -150,13 +151,14 @@ func (kv *ShardKV) ShardsRequester() {
 		// BUG: need to use prevConfig to locate the shards.
 		serversCopy := shardctrler.GetGroupMapCopy(kv.prevConfig.Groups)
 		shardsCopy := shardctrler.GetShardsCopy(kv.prevConfig.Shards)
+		configNumCopy := kv.config.Num
 		kv.mu.Unlock()
 
 		for _, i := range pullingShards {
 			targetGID := shardsCopy[i]
 			servers, ok := serversCopy[targetGID]
 			shardIndex := i
-			args := ShardRequestArgs{kv.config.Num, shardIndex, kv.gid}
+			args := ShardRequestArgs{configNumCopy, shardIndex, kv.gid}
 			PrettyDebug(dInfo, "KVServer %d-%d send to GID: %d ShardRequestArgs: %s", kv.gid, kv.me, targetGID, args.String())
 			if !ok {
 				continue
@@ -166,19 +168,15 @@ func (kv *ShardKV) ShardsRequester() {
 					srv := kv.make_end(servers[si])
 					var reply ShardRequestReply
 					ok := srv.Call("ShardKV.ShardsRequestHandler", &args, &reply)
-					kv.mu.Lock()
-					if ok && reply.Err == OK && reply.ConfigNum == kv.config.Num {
+					if ok && reply.Err == OK && reply.ConfigNum == configNumCopy {
 						if reply.ShardIndex != shardIndex {
 							panic("reply.ShardIndex != shardIndex")
 						}
 						shardRequestMsg := ShardRequestMsg{args.ConfigNum, args.ShardIndex, args.GID, reply.ShardData, reply.ClientSeqNum}
 						msg := CommandMsg{ShardRequestOperation, shardRequestMsg}
-
-						kv.mu.Unlock()
 						_, _, _ = kv.rf.Start(msg)
 						return
 					}
-					kv.mu.Unlock()
 				}
 			}(i)
 		}
@@ -239,7 +237,7 @@ func (kv *ShardKV) ShardsConfirmHandler(args *ShardConfirmArgs, reply *ShardConf
 
 	if (kv.config.Num == args.ConfigNum && kv.shardsState[args.ShardIndex] == SERVING) || kv.config.Num > args.ConfigNum {
 		reply.Err = OK
-		reply.ConfigNum = kv.config.Num
+		reply.ConfigNum = args.ConfigNum
 		reply.ShardIndex = args.ShardIndex
 		reply.ShardState = SERVING
 		PrettyDebug(dServer, "KVServer %d-%d ShardsConfirmHandler reply ShardConfirmReply %s", kv.gid, kv.me, reply.String())
@@ -280,6 +278,7 @@ func (kv *ShardKV) ShardsConfirm() {
 		}
 		serversCopy := shardctrler.GetGroupMapCopy(kv.config.Groups)
 		shardsCopy := shardctrler.GetShardsCopy(kv.config.Shards)
+		configNumCopy := kv.config.Num
 		kv.mu.Unlock()
 
 		PrettyDebug(dServer, "KVServer %d-%d ShardsConfirm bePulledShards:%v", kv.gid, kv.me, bePulledShards)
@@ -287,7 +286,7 @@ func (kv *ShardKV) ShardsConfirm() {
 			targetGID := shardsCopy[i]
 			servers, ok := serversCopy[targetGID]
 			shardIndex := i
-			args := ShardConfirmArgs{kv.config.Num, shardIndex}
+			args := ShardConfirmArgs{configNumCopy, shardIndex}
 			if !ok {
 				continue
 			}
@@ -297,15 +296,11 @@ func (kv *ShardKV) ShardsConfirm() {
 					var reply ShardConfirmReply
 					PrettyDebug(dInfo, "KVServer %d-%d send to GID: %d ShardConfirm: %s", kv.gid, kv.me, targetGID, args.String())
 					ok := srv.Call("ShardKV.ShardsConfirmHandler", &args, &reply)
-					kv.mu.Lock()
-					if ok && reply.Err == OK && reply.ConfigNum >= kv.config.Num {
+					if ok && reply.Err == OK && reply.ConfigNum >= args.ConfigNum {
 						shardConfirmMsg := ShardConfirmMsg{ConfigNum: args.ConfigNum, ShardIndex: args.ShardIndex, ShardState: reply.ShardState}
 						msg := CommandMsg{ShardConfirmOperation, shardConfirmMsg}
-						kv.mu.Unlock()
 						_, _, _ = kv.rf.Start(msg)
-						return
 					}
-					kv.mu.Unlock()
 				}
 			}(shardIndex)
 		}
