@@ -30,6 +30,7 @@ const (
 	ConfigOperation       = 2
 	ShardRequestOperation = 3
 	ShardConfirmOperation = 4
+	NoOperation           = 5
 )
 
 type CommandMsg struct {
@@ -119,6 +120,17 @@ func (reply *ShardConfirmReply) String() string {
 	return fmt.Sprintf("ShardConfirmReply: Err: %s, ConfigNum: %d, ShardState: %d", reply.Err, reply.ConfigNum, reply.ShardState)
 }
 
+func (kv *ShardKV) RaftLogChecker() {
+	for !kv.killed() {
+		needEmptyLog := kv.rf.NeedEmptyLogEntry()
+		if needEmptyLog {
+			PrettyDebug(dPersist, "KVServer %d-%d needEmptyLogEntry", kv.gid, kv.me)
+			commandMsg := CommandMsg{NoOperation, nil}
+			kv.rf.Start(commandMsg)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}
 func (kv *ShardKV) ShardsRequester() {
 	for !kv.killed() {
 		_, isLeader := kv.rf.GetState()
@@ -301,16 +313,6 @@ func (kv *ShardKV) ShardsConfirm() {
 	}
 }
 
-/*
-// A configuration -- an assignment of shards to groups.
-// Please don't change this.
-type Config struct {
-	Num    int              // config number
-	Shards [NShards]int     // shard -> gid
-	Groups map[int][]string // gid -> servers[]
-}
-*/
-
 type ConfigMsg struct {
 	Num    int                      // config number
 	Shards [shardctrler.NShards]int // shard -> gid
@@ -363,7 +365,6 @@ const (
 	NO_SERVING = 2
 	PULLING    = 3
 	BEPULLED   = 4
-	GCING      = 5
 )
 
 // 1.Check if there's new config. If not, sleep for 100ms
@@ -415,11 +416,6 @@ func (kv *ShardKV) shardsStateReady() bool {
 }
 func (kv *ShardKV) isWrongGroup(shardIndex int) bool {
 	kv.mu.Lock()
-	/*
-		if kv.config.Num == 0 {
-			panic("kv.config.Num == 0")
-		}
-	*/
 	defer kv.mu.Unlock()
 	return kv.config.Shards[shardIndex] != kv.gid
 }
@@ -580,6 +576,11 @@ func (kv *ShardKV) applyHandler() {
 					msg = CommandMsg{CommandType: ShardConfirmOperation, Data: shardConfirmMsg}
 					PrettyDebug(dServer, "KVServer %d-%d REJECT ShardConfirmMsg %s", kv.gid, kv.me, shardConfirmMsg.String())
 
+				case NoOperation:
+					kv.mu.Unlock()
+					PrettyDebug(dServer, "KVServer %d-%d APPLY HANDLER get NoOperation", kv.gid, kv.me)
+					continue
+
 				default:
 					panic("Unknown command type")
 				}
@@ -601,10 +602,7 @@ func (kv *ShardKV) applyHandler() {
 					case <-time.After(1 * time.Second):
 						fmt.Println("Leader chan timeout")
 					}
-				} else {
-					PrettyDebug(dError, "KVServer %d-%d want to send msg %s , but no channel for commandIndex %d", kv.gid, kv.me, msg.String(), commandIndex)
 				}
-
 			}
 		}
 	}
@@ -879,5 +877,6 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	go kv.getLastConfig()
 	go kv.ShardsRequester()
 	go kv.ShardsConfirm()
+	go kv.RaftLogChecker()
 	return kv
 }

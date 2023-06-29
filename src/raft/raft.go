@@ -136,6 +136,14 @@ func (rf *Raft) getLastLogTerm() int {
 	return term
 }
 
+// Check if the leader has current Term's log
+func (rf *Raft) NeedEmptyLogEntry() bool {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	_, _, term := rf.getLogAt(len(rf.Log) - 1)
+	return rf.state == LEADER && term != rf.currentTerm
+}
+
 // exist, index, term
 func (rf *Raft) getLogAt(realIndex int) (bool, int, int) {
 	if realIndex >= len(rf.Log) {
