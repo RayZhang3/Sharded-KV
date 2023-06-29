@@ -1184,6 +1184,11 @@ func (rf *Raft) killed() bool {
 	return z == 1
 }
 
+func (rf *Raft) Killed() bool {
+	z := atomic.LoadInt32(&rf.dead)
+	return z == 1
+}
+
 func (rf *Raft) heartBeat() {
 	// Heatbeat time out
 	HeartbeatTimeout := make(chan bool)

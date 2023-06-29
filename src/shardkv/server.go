@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"fmt"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"6.824/labgob"
@@ -172,7 +171,8 @@ func (kv *ShardKV) ShardsRequester() {
 					kv.mu.Lock()
 					if ok && reply.Err == OK && reply.ConfigNum == kv.config.Num {
 						if reply.ShardIndex != shardIndex {
-							panic("reply.ShardIndex != shardIndex")
+							PrettyDebug(dError, "KVServer %d-%d ShardsRequester: reply.ShardIndex != shardIndex", kv.gid, kv.me)
+							return
 						}
 						shardRequestMsg := ShardRequestMsg{args.ConfigNum, args.ShardIndex, args.GID, reply.ShardData, reply.ClientSeqNum}
 						msg := CommandMsg{ShardRequestOperation, shardRequestMsg}
@@ -200,7 +200,7 @@ func (kv *ShardKV) ShardsRequestHandler(args *ShardRequestArgs, reply *ShardRequ
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 	if args.ConfigNum != kv.config.Num {
-		PrettyDebug(dError, "KVServer %d-%d ShardsRequestHandler receive WRONG ShardRequestArgs %s", kv.gid, kv.me, args.String())
+		PrettyDebug(dInfo, "KVServer %d-%d ShardsRequestHandler receive WRONG ShardRequestArgs %s", kv.gid, kv.me, args.String())
 		reply.Err = ErrConfig
 		return
 	}
@@ -243,7 +243,7 @@ func (kv *ShardKV) ShardsConfirmHandler(args *ShardConfirmArgs, reply *ShardConf
 
 	if kv.config.Num < args.ConfigNum {
 		reply.Err = ErrConfig
-		PrettyDebug(dError, "KVServer %d-%d ShardsConfirmHandler receive WRONG ShardConfirmArgs %s", kv.gid, kv.me, args.String())
+		PrettyDebug(dInfo, "KVServer %d-%d ShardsConfirmHandler receive WRONG ShardConfirmArgs %s", kv.gid, kv.me, args.String())
 		return
 	}
 
@@ -550,7 +550,7 @@ func (kv *ShardKV) applyHandler() {
 					continue
 
 				default:
-					panic("Unknown command type")
+					PrettyDebug(dError, "KVServer %d-%d APPLY HANDLER get UNKNOWN COMMAND", kv.gid, kv.me)
 				}
 
 				// take snapshot and send msg
@@ -760,14 +760,16 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 // turn off debug output from this instance.
 //
 func (kv *ShardKV) Kill() {
-	kv.rf.Kill()
+	// kv.rf.Kill()
 	// Your code here, if desired.
-	atomic.StoreInt32(&kv.dead, 1)
+	// atomic.StoreInt32(&kv.dead, 1)
+	kv.rf.Kill()
 }
 
 func (kv *ShardKV) killed() bool {
-	z := atomic.LoadInt32(&kv.dead)
-	return z == 1
+	// z := atomic.LoadInt32(&kv.dead)
+	// return z == 1
+	return kv.rf.Killed()
 }
 
 //
@@ -846,7 +848,37 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	go kv.ShardsRequester()
 	go kv.ShardsConfirm()
 	go kv.RaftLogChecker()
+	go kv.liveCheck()
+	go kv.deadLockCheck()
 	return kv
+}
+
+func (kv *ShardKV) liveCheck() {
+	ch := make(chan bool)
+	go func() {
+		time.Sleep(time.Second * 2)
+		ch <- true
+	}()
+	for !kv.killed() {
+		if <-ch {
+			PrettyDebug(dTimer, "KVServer %d-%d live check", kv.gid, kv.me)
+		}
+	}
+}
+
+func (kv *ShardKV) deadLockCheck() {
+	ch := make(chan bool)
+	go func() {
+		time.Sleep(time.Second * 2)
+		ch <- true
+	}()
+	for !kv.killed() {
+		if <-ch {
+			kv.mu.Lock()
+			PrettyDebug(dTimer, "KVServer %d-%d deadlock check", kv.gid, kv.me)
+			kv.mu.Unlock()
+		}
+	}
 }
 
 func (op *Op) String() string {
