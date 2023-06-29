@@ -13,11 +13,22 @@ import (
 	"6.824/shardctrler"
 )
 
+const (
+	KVOperation           = 1 // Put/Append/Get
+	ConfigOperation       = 2 // Config
+	ShardRequestOperation = 3
+	ShardConfirmOperation = 4
+	NoOperation           = 5
+)
+
+const (
+	SERVING    = 1 // The shard is Serving in this config, apply KVOperation
+	NO_SERVING = 2 // The shard is no Serving in this config, need to query other group
+	PULLING    = 3 // Shard need to pull the shards from other group (according to prevConfig)
+	BEPULLED   = 4 // Shard need to be pulled by other group (according to current Config)
+)
+
 type Op struct {
-	// Your definitions here.
-	// Field names must start with capital letters,
-	// otherwise RPC will break.
-	// Lab 3B
 	ClientID int64
 	SeqNum   int
 	Key      string
@@ -25,13 +36,11 @@ type Op struct {
 	Optype   string
 }
 
-const (
-	KVOperation           = 1
-	ConfigOperation       = 2
-	ShardRequestOperation = 3
-	ShardConfirmOperation = 4
-	NoOperation           = 5
-)
+type ConfigMsg struct {
+	Num    int                      // config number
+	Shards [shardctrler.NShards]int // shard -> gid
+	Groups map[int][]string         // gid -> servers[]
+}
 
 type CommandMsg struct {
 	CommandType int
@@ -47,33 +56,10 @@ type ShardRequestMsg struct {
 	ClientSeqNum map[int64]int
 }
 
-func (shardRequestMsg *ShardRequestMsg) String() string {
-	return fmt.Sprintf("ShardRequestMsg: ConfigNum: %d, ShardIndex: %d, GID: %d, ShardData: %v", shardRequestMsg.ConfigNum, shardRequestMsg.ShardIndex, shardRequestMsg.GID, shardRequestMsg.ShardData)
-}
-
 type ShardConfirmMsg struct {
 	ConfigNum  int
 	ShardIndex int
 	ShardState int
-}
-
-func (shardConfirmMsg *ShardConfirmMsg) String() string {
-	return fmt.Sprintf("ShardConfirmMsg: ConfigNum: %d, ShardIndex: %d, ShardState: %d", shardConfirmMsg.ConfigNum, shardConfirmMsg.ShardIndex, shardConfirmMsg.ShardState)
-}
-
-func (commandMsg *CommandMsg) String() string {
-	switch commandMsg.CommandType {
-	case KVOperation:
-		return fmt.Sprintf("CommandMsg: CommandType: %s, Data: %v", "KVOperation", commandMsg.Data)
-	case ConfigOperation:
-		return fmt.Sprintf("CommandMsg: CommandType: %s, Data: %v", "ConfigOperation", commandMsg.Data)
-	case ShardRequestOperation:
-		return fmt.Sprintf("CommandMsg: CommandType: %s, Data: %v", "ShardRequestOperation", commandMsg.Data)
-	case ShardConfirmOperation:
-		return fmt.Sprintf("CommandMsg: CommandType: %s, Data: %v", "ShardConfirmOperation", commandMsg.Data)
-	}
-
-	return fmt.Sprintf("CommandMsg: CommandType: %s, Data: %v", "Unknown", commandMsg.Data)
 }
 
 // RPC between Servers.
@@ -81,10 +67,6 @@ type ShardRequestArgs struct {
 	ConfigNum  int
 	ShardIndex int
 	GID        int
-}
-
-func (args *ShardRequestArgs) String() string {
-	return fmt.Sprintf("ShardRequestArgs: ConfigNum: %d, ShardIndex: %d, GID: %d", args.ConfigNum, args.ShardIndex, args.GID)
 }
 
 type ShardRequestReply struct {
@@ -96,17 +78,9 @@ type ShardRequestReply struct {
 	ClientSeqNum map[int64]int
 }
 
-func (reply *ShardRequestReply) String() string {
-	return fmt.Sprintf("ShardRequestReply: Err: %s, ConfigNum: %d, ShardIndex: %d, ShardData: %v", reply.Err, reply.ConfigNum, reply.ShardIndex, reply.ShardData)
-}
-
 type ShardConfirmArgs struct {
 	ConfigNum  int
 	ShardIndex int
-}
-
-func (args *ShardConfirmArgs) String() string {
-	return fmt.Sprintf("ShardConfirmArgs: ConfigNum: %d, ShardIndex: %d", args.ConfigNum, args.ShardIndex)
 }
 
 type ShardConfirmReply struct {
@@ -116,22 +90,50 @@ type ShardConfirmReply struct {
 	ShardState int
 }
 
-func (reply *ShardConfirmReply) String() string {
-	return fmt.Sprintf("ShardConfirmReply: Err: %s, ConfigNum: %d, ShardIndex: %d, ShardState: %d", reply.Err, reply.ConfigNum, reply.ShardIndex, reply.ShardState)
+type ShardKV struct {
+	mu           sync.Mutex
+	me           int
+	rf           *raft.Raft
+	applyCh      chan raft.ApplyMsg
+	dead         int32 // set by Kill()
+	maxraftstate int   // snapshot if log grows this big
+
+	make_end func(string) *labrpc.ClientEnd
+	gid      int
+	ctrlers  []*labrpc.ClientEnd
+
+	// Your definitions here.
+	currentState      map[string]string       // Key-Value Storage(Persistent)
+	waitChan          map[int]chan CommandMsg // Wait channel for each LogEntry.  Server to Client
+	clientSeq         map[int64]int           // ClientID -> SeqNum (Persistent)
+	lastIncludedIndex int                     // for snapshot
+
+	// Lab 4B
+	mck         *shardctrler.Clerk       // Fetch config
+	config      shardctrler.Config       // Current config (Persistent)
+	prevConfig  shardctrler.Config       // Prev config (Persistent)
+	shardsState [shardctrler.NShards]int // Shard state (Persistent)
 }
 
+// Function: Avoid liveLock
+// Periodically check if the raft (isLeader && has LogEntry with its term)
+// If yes, send an empty LogEntry to the raft
 func (kv *ShardKV) RaftLogChecker() {
 	for !kv.killed() {
+		PrettyDebug(dPersist, "KVServer %d-%d RaftLogChecker Starts", kv.gid, kv.me)
 		needEmptyLog := kv.rf.NeedEmptyLogEntry()
 		if needEmptyLog {
 			PrettyDebug(dPersist, "KVServer %d-%d needEmptyLogEntry", kv.gid, kv.me)
 			commandMsg := CommandMsg{NoOperation, nil}
 			kv.rf.Start(commandMsg)
 		}
-		time.Sleep(1000 * time.Millisecond)
+		time.Sleep(300 * time.Millisecond)
 	}
 }
 
+// Periodically check if need to PULL shards (ShardsState == PULLING)
+// We need to pull shards according to prevConfig.Shards
+// If yes, send a shard request to the other group
 func (kv *ShardKV) ShardsRequester() {
 	for !kv.killed() {
 		_, isLeader := kv.rf.GetState()
@@ -151,14 +153,13 @@ func (kv *ShardKV) ShardsRequester() {
 		// BUG: need to use prevConfig to locate the shards.
 		serversCopy := shardctrler.GetGroupMapCopy(kv.prevConfig.Groups)
 		shardsCopy := shardctrler.GetShardsCopy(kv.prevConfig.Shards)
-		configNumCopy := kv.config.Num
 		kv.mu.Unlock()
 
 		for _, i := range pullingShards {
 			targetGID := shardsCopy[i]
 			servers, ok := serversCopy[targetGID]
 			shardIndex := i
-			args := ShardRequestArgs{configNumCopy, shardIndex, kv.gid}
+			args := ShardRequestArgs{kv.config.Num, shardIndex, kv.gid}
 			PrettyDebug(dInfo, "KVServer %d-%d send to GID: %d ShardRequestArgs: %s", kv.gid, kv.me, targetGID, args.String())
 			if !ok {
 				continue
@@ -168,15 +169,19 @@ func (kv *ShardKV) ShardsRequester() {
 					srv := kv.make_end(servers[si])
 					var reply ShardRequestReply
 					ok := srv.Call("ShardKV.ShardsRequestHandler", &args, &reply)
-					if ok && reply.Err == OK && reply.ConfigNum == configNumCopy {
+					kv.mu.Lock()
+					if ok && reply.Err == OK && reply.ConfigNum == kv.config.Num {
 						if reply.ShardIndex != shardIndex {
 							panic("reply.ShardIndex != shardIndex")
 						}
 						shardRequestMsg := ShardRequestMsg{args.ConfigNum, args.ShardIndex, args.GID, reply.ShardData, reply.ClientSeqNum}
 						msg := CommandMsg{ShardRequestOperation, shardRequestMsg}
+
+						kv.mu.Unlock()
 						_, _, _ = kv.rf.Start(msg)
 						return
 					}
+					kv.mu.Unlock()
 				}
 			}(i)
 		}
@@ -184,6 +189,9 @@ func (kv *ShardKV) ShardsRequester() {
 	}
 }
 
+// Handle the ShardRequest RPC From other group
+// If the configNum is not matched, reply ErrConfig
+// If matched, reply the Shard Data and all ClientSeqNum Data
 func (kv *ShardKV) ShardsRequestHandler(args *ShardRequestArgs, reply *ShardRequestReply) {
 	_, isLeader := kv.rf.GetState()
 	if !isLeader {
@@ -219,6 +227,10 @@ func (kv *ShardKV) ShardsRequestHandler(args *ShardRequestArgs, reply *ShardRequ
 	return
 }
 
+// Handle the ShardConfirm RPC From other group
+// If args.configNum > kv.configNum , reply ErrConfig
+// BUT, If args.configNum < kv.configNum, reply OK. Because kv must have been receive the shard data before
+// If args.configNum == kv.configNum, check the status of the shard
 func (kv *ShardKV) ShardsConfirmHandler(args *ShardConfirmArgs, reply *ShardConfirmReply) {
 	_, isLeader := kv.rf.GetState()
 	if !isLeader {
@@ -237,7 +249,7 @@ func (kv *ShardKV) ShardsConfirmHandler(args *ShardConfirmArgs, reply *ShardConf
 
 	if (kv.config.Num == args.ConfigNum && kv.shardsState[args.ShardIndex] == SERVING) || kv.config.Num > args.ConfigNum {
 		reply.Err = OK
-		reply.ConfigNum = args.ConfigNum
+		reply.ConfigNum = kv.config.Num
 		reply.ShardIndex = args.ShardIndex
 		reply.ShardState = SERVING
 		PrettyDebug(dServer, "KVServer %d-%d ShardsConfirmHandler reply ShardConfirmReply %s", kv.gid, kv.me, reply.String())
@@ -246,7 +258,7 @@ func (kv *ShardKV) ShardsConfirmHandler(args *ShardConfirmArgs, reply *ShardConf
 	reply.Err = ErrWrongLeader
 }
 
-// Locked
+// Merge the shard data to the currentState
 func (kv *ShardKV) mergeShardData(shardIndex int, shardData map[string]string) {
 	for key, value := range shardData {
 		kv.currentState[key] = value
@@ -255,6 +267,7 @@ func (kv *ShardKV) mergeShardData(shardIndex int, shardData map[string]string) {
 	PrettyDebug(dServer, "KVServer %d-%d mergeShardIndex %d, kv.currentState:%v", kv.gid, kv.me, shardIndex, kv.shardsState)
 }
 
+// Merge the the group's clientSeqNum with others
 func (kv *ShardKV) mergeClientSeqNum(clientSeqNum map[int64]int) {
 	for key, value := range clientSeqNum {
 		if kv.clientSeq[key] < value {
@@ -262,6 +275,9 @@ func (kv *ShardKV) mergeClientSeqNum(clientSeqNum map[int64]int) {
 		}
 	}
 }
+
+// Periodically check if the shards need to be PULLED (ShardsState == BEPULLED)
+// If yes, send a shard request to the other group
 func (kv *ShardKV) ShardsConfirm() {
 	for !kv.killed() {
 		_, isLeader := kv.rf.GetState()
@@ -278,7 +294,6 @@ func (kv *ShardKV) ShardsConfirm() {
 		}
 		serversCopy := shardctrler.GetGroupMapCopy(kv.config.Groups)
 		shardsCopy := shardctrler.GetShardsCopy(kv.config.Shards)
-		configNumCopy := kv.config.Num
 		kv.mu.Unlock()
 
 		PrettyDebug(dServer, "KVServer %d-%d ShardsConfirm bePulledShards:%v", kv.gid, kv.me, bePulledShards)
@@ -286,7 +301,7 @@ func (kv *ShardKV) ShardsConfirm() {
 			targetGID := shardsCopy[i]
 			servers, ok := serversCopy[targetGID]
 			shardIndex := i
-			args := ShardConfirmArgs{configNumCopy, shardIndex}
+			args := ShardConfirmArgs{kv.config.Num, shardIndex}
 			if !ok {
 				continue
 			}
@@ -296,11 +311,15 @@ func (kv *ShardKV) ShardsConfirm() {
 					var reply ShardConfirmReply
 					PrettyDebug(dInfo, "KVServer %d-%d send to GID: %d ShardConfirm: %s", kv.gid, kv.me, targetGID, args.String())
 					ok := srv.Call("ShardKV.ShardsConfirmHandler", &args, &reply)
-					if ok && reply.Err == OK && reply.ConfigNum >= args.ConfigNum {
+					kv.mu.Lock()
+					if ok && reply.Err == OK && reply.ConfigNum >= kv.config.Num {
 						shardConfirmMsg := ShardConfirmMsg{ConfigNum: args.ConfigNum, ShardIndex: args.ShardIndex, ShardState: reply.ShardState}
 						msg := CommandMsg{ShardConfirmOperation, shardConfirmMsg}
+						kv.mu.Unlock()
 						_, _, _ = kv.rf.Start(msg)
+						return
 					}
+					kv.mu.Unlock()
 				}
 			}(shardIndex)
 		}
@@ -308,65 +327,11 @@ func (kv *ShardKV) ShardsConfirm() {
 	}
 }
 
-type ConfigMsg struct {
-	Num    int                      // config number
-	Shards [shardctrler.NShards]int // shard -> gid
-	Groups map[int][]string         // gid -> servers[]
-}
-
-func (config *ConfigMsg) String() string {
-	return fmt.Sprintf("ConfigMsg: Num: %v, Shards: %v, Groups: %v", config.Num, config.Shards, config.Groups)
-}
-
-func (op *Op) String() string {
-	switch op.Optype {
-	case "Get":
-		return fmt.Sprintf("Optype: %s, ClientID:%d, SeqNum %d, Key: %s", op.Optype, op.ClientID, op.SeqNum, op.Key)
-	case "Put":
-		return fmt.Sprintf("Optype: %s, ClientID:%d, SeqNum %d, Key: %v, Value: %v", op.Optype, op.ClientID, op.SeqNum, op.Key, op.Value)
-	case "Append":
-		return fmt.Sprintf("Optype: %s, ClientID:%d, SeqNum %d, Key: %v, Value: %v", op.Optype, op.ClientID, op.SeqNum, op.Key, op.Value)
-	}
-	return fmt.Sprintf("Optype: %s, ClientID:%d, SeqNum %d, Key: %v, Value: %v", op.Optype, op.ClientID, op.SeqNum, op.Key, op.Value)
-}
-
-type ShardKV struct {
-	mu           sync.Mutex
-	me           int
-	rf           *raft.Raft
-	applyCh      chan raft.ApplyMsg
-	dead         int32 // set by Kill()
-	maxraftstate int   // snapshot if log grows this big
-
-	make_end func(string) *labrpc.ClientEnd
-	gid      int
-	ctrlers  []*labrpc.ClientEnd
-
-	// Your definitions here.
-	currentState      map[string]string
-	waitChan          map[int]chan CommandMsg
-	clientSeq         map[int64]int
-	lastIncludedIndex int // for snapshot
-
-	// Lab 4B
-	mck         *shardctrler.Clerk
-	config      shardctrler.Config
-	prevConfig  shardctrler.Config
-	shardsState [shardctrler.NShards]int
-}
-
-const (
-	SERVING    = 1
-	NO_SERVING = 2
-	PULLING    = 3
-	BEPULLED   = 4
-)
-
-// 1.Check if there's new config. If not, sleep for 100ms
-// 2.If there's new config,
-// 3.Put the config into raft, Wait for the new config to be applied (Commit by raft)
-// 4.If the new config is applied, set the shard state. If the new config is not applied, go to step 3
-// 5.Set the shards state and wait
+// 1. Check if it's leader. If not, sleep for 100ms
+// 2. Check if there's new config. If not, sleep for 100ms and go to Step1.
+// 3. If there's new config, check if all shards are ready. If not, sleep for 100ms and go to Step1.
+// 4. Fetch the next config (kv.config.Num + 1).
+// 5. Put the config into raft.
 
 func (kv *ShardKV) getLastConfig() {
 	for !kv.killed() {
@@ -400,6 +365,7 @@ func (kv *ShardKV) getLastConfig() {
 	}
 }
 
+// If all shards are SERVING or NO_SERVING, return true
 func (kv *ShardKV) shardsStateReady() bool {
 	for i := 0; i < len(kv.shardsState); i++ {
 		if kv.shardsState[i] != NO_SERVING && kv.shardsState[i] != SERVING {
@@ -409,13 +375,15 @@ func (kv *ShardKV) shardsStateReady() bool {
 	}
 	return true
 }
+
+// If the shard is not contains in current group, return true
 func (kv *ShardKV) isWrongGroup(shardIndex int) bool {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 	return kv.config.Shards[shardIndex] != kv.gid
 }
 
-// Code from Lab3
+// Persist the server data to the snapshot
 func (kv *ShardKV) getServerPersistData() []byte {
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
@@ -429,6 +397,7 @@ func (kv *ShardKV) getServerPersistData() []byte {
 	return data
 }
 
+// Read the server data from the snapshot
 func (kv *ShardKV) readServerPersistData(data []byte) {
 	if data == nil || len(data) < 1 { // bootstrap without any state?
 		return
@@ -452,9 +421,12 @@ func (kv *ShardKV) readServerPersistData(data []byte) {
 	}
 }
 
-func (kv *ShardKV) String() {
-	fmt.Printf("KVServer{GID: %d, me:%d, currentState:%v, waitChan:%v, clientSeq:%v}\n", kv.gid, kv.me, kv.currentState, kv.waitChan, kv.clientSeq)
-}
+// Handle the applyMsg from raft
+// Snapshot: Valid the snapshot(check lastIncludedIndex > commitIndex, Trim raft log) and Install Snapshot.
+// KVOperation: PUT/APPEND/GET. Check the
+// ConfigOperation: Update the config
+// ShardRequestOperation: Update the KVServer's shard Data, State and clientSeqNum Map
+// ShardConfirmOperation: Update the KVServer's shard State
 
 func (kv *ShardKV) applyHandler() {
 	for !kv.killed() {
@@ -527,7 +499,7 @@ func (kv *ShardKV) applyHandler() {
 						PrettyDebug(dServer, "KVServer %d-%d updateShardsState %v", kv.gid, kv.me, kv.shardsState)
 						// update the state of shards.
 					}
-					msg = applyMsg.Command.(CommandMsg)
+					msg = CommandMsg{CommandType: ConfigOperation, Data: applyConfig}
 
 				case ShardRequestOperation:
 					shardRequestMsg := commandMsg.Data.(ShardRequestMsg)
@@ -574,6 +546,7 @@ func (kv *ShardKV) applyHandler() {
 				case NoOperation:
 					kv.mu.Unlock()
 					PrettyDebug(dServer, "KVServer %d-%d APPLY HANDLER get NoOperation", kv.gid, kv.me)
+					msg = CommandMsg{CommandType: NoOperation, Data: nil}
 					continue
 
 				default:
@@ -874,4 +847,55 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	go kv.ShardsConfirm()
 	go kv.RaftLogChecker()
 	return kv
+}
+
+func (op *Op) String() string {
+	switch op.Optype {
+	case "Get":
+		return fmt.Sprintf("Optype: %s, ClientID:%d, SeqNum %d, Key: %s", op.Optype, op.ClientID, op.SeqNum, op.Key)
+	case "Put":
+		return fmt.Sprintf("Optype: %s, ClientID:%d, SeqNum %d, Key: %v, Value: %v", op.Optype, op.ClientID, op.SeqNum, op.Key, op.Value)
+	case "Append":
+		return fmt.Sprintf("Optype: %s, ClientID:%d, SeqNum %d, Key: %v, Value: %v", op.Optype, op.ClientID, op.SeqNum, op.Key, op.Value)
+	}
+	return fmt.Sprintf("Optype: %s, ClientID:%d, SeqNum %d, Key: %v, Value: %v", op.Optype, op.ClientID, op.SeqNum, op.Key, op.Value)
+}
+func (config *ConfigMsg) String() string {
+	return fmt.Sprintf("ConfigMsg: Num: %v, Shards: %v, Groups: %v", config.Num, config.Shards, config.Groups)
+}
+func (shardRequestMsg *ShardRequestMsg) String() string {
+	return fmt.Sprintf("ShardRequestMsg: ConfigNum: %d, ShardIndex: %d, GID: %d, ShardData: %v", shardRequestMsg.ConfigNum, shardRequestMsg.ShardIndex, shardRequestMsg.GID, shardRequestMsg.ShardData)
+}
+func (shardConfirmMsg *ShardConfirmMsg) String() string {
+	return fmt.Sprintf("ShardConfirmMsg: ConfigNum: %d, ShardIndex: %d, ShardState: %d", shardConfirmMsg.ConfigNum, shardConfirmMsg.ShardIndex, shardConfirmMsg.ShardState)
+}
+func (commandMsg *CommandMsg) String() string {
+	switch commandMsg.CommandType {
+	case KVOperation:
+		return fmt.Sprintf("CommandMsg: CommandType: %s, Data: %v", "KVOperation", commandMsg.Data)
+	case ConfigOperation:
+		return fmt.Sprintf("CommandMsg: CommandType: %s, Data: %v", "ConfigOperation", commandMsg.Data)
+	case ShardRequestOperation:
+		return fmt.Sprintf("CommandMsg: CommandType: %s, Data: %v", "ShardRequestOperation", commandMsg.Data)
+	case ShardConfirmOperation:
+		return fmt.Sprintf("CommandMsg: CommandType: %s, Data: %v", "ShardConfirmOperation", commandMsg.Data)
+	}
+
+	return fmt.Sprintf("CommandMsg: CommandType: %s, Data: %v", "Unknown", commandMsg.Data)
+}
+func (args *ShardRequestArgs) String() string {
+	return fmt.Sprintf("ShardRequestArgs: ConfigNum: %d, ShardIndex: %d, GID: %d", args.ConfigNum, args.ShardIndex, args.GID)
+}
+func (reply *ShardRequestReply) String() string {
+	return fmt.Sprintf("ShardRequestReply: Err: %s, ConfigNum: %d, ShardIndex: %d, ShardData: %v", reply.Err, reply.ConfigNum, reply.ShardIndex, reply.ShardData)
+}
+func (args *ShardConfirmArgs) String() string {
+	return fmt.Sprintf("ShardConfirmArgs: ConfigNum: %d, ShardIndex: %d", args.ConfigNum, args.ShardIndex)
+}
+func (reply *ShardConfirmReply) String() string {
+	return fmt.Sprintf("ShardConfirmReply: Err: %s, ConfigNum: %d, ShardState: %d", reply.Err, reply.ConfigNum, reply.ShardState)
+}
+
+func (kv *ShardKV) String() {
+	fmt.Printf("KVServer{GID: %d, me:%d, currentState:%v, waitChan:%v, clientSeq:%v}\n", kv.gid, kv.me, kv.currentState, kv.waitChan, kv.clientSeq)
 }
