@@ -118,15 +118,22 @@ type ShardKV struct {
 // Periodically check if the raft (isLeader && has LogEntry with its term)
 // If yes, send an empty LogEntry to the raft
 func (kv *ShardKV) RaftLogChecker() {
-	for !kv.killed() {
-		PrettyDebug(dPersist, "KVServer %d-%d RaftLogChecker Starts", kv.gid, kv.me)
-		needEmptyLog := kv.rf.NeedEmptyLogEntry()
-		if needEmptyLog {
-			PrettyDebug(dPersist, "KVServer %d-%d needEmptyLogEntry", kv.gid, kv.me)
-			commandMsg := CommandMsg{NoOperation, nil}
-			kv.rf.Start(commandMsg)
+	ch := make(chan bool)
+	defer close(ch)
+	go func() {
+		time.Sleep(time.Millisecond * 500)
+		ch <- true
+	}()
+	PrettyDebug(dPersist, "KVServer %d-%d RaftLogChecker Starts", kv.gid, kv.me)
+	for {
+		if <-ch {
+			needEmptyLog := kv.rf.NeedEmptyLogEntry()
+			if needEmptyLog {
+				PrettyDebug(dPersist, "KVServer %d-%d needEmptyLogEntry", kv.gid, kv.me)
+				commandMsg := CommandMsg{NoOperation, nil}
+				kv.rf.Start(commandMsg)
+			}
 		}
-		time.Sleep(300 * time.Millisecond)
 	}
 }
 
@@ -848,18 +855,21 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	go kv.ShardsRequester()
 	go kv.ShardsConfirm()
 	go kv.RaftLogChecker()
-	go kv.liveCheck()
-	go kv.deadLockCheck()
+	// go kv.liveCheck()
+	// go kv.deadLockCheck()
 	return kv
 }
 
 func (kv *ShardKV) liveCheck() {
 	ch := make(chan bool)
+	defer close(ch)
 	go func() {
-		time.Sleep(time.Second * 2)
-		ch <- true
+		for {
+			time.Sleep(time.Second * 2)
+			ch <- true
+		}
 	}()
-	for !kv.killed() {
+	for {
 		if <-ch {
 			PrettyDebug(dTimer, "KVServer %d-%d live check", kv.gid, kv.me)
 		}
@@ -868,11 +878,14 @@ func (kv *ShardKV) liveCheck() {
 
 func (kv *ShardKV) deadLockCheck() {
 	ch := make(chan bool)
+	defer close(ch)
 	go func() {
-		time.Sleep(time.Second * 2)
-		ch <- true
+		for {
+			time.Sleep(time.Second * 2)
+			ch <- true
+		}
 	}()
-	for !kv.killed() {
+	for {
 		if <-ch {
 			kv.mu.Lock()
 			PrettyDebug(dTimer, "KVServer %d-%d deadlock check", kv.gid, kv.me)
