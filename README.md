@@ -45,6 +45,66 @@ shardKV 是multi-raft的实现，一个raft节点对应一个状态机，多个r
 
 
 # Lab3
+## Goals
+Lab3需要实现的部分： Clerk machine和service/state machine replica 的交互，clerk和Server有RPC的交互，包括get, put, append
+Service为Clerk的这些指令提供强一致性，对于并行的请求，返回值和系统状态应该和特定顺序下串行执行一致，RPC调用应该能看到之前所有RPC调用的影响。
+代码部分：client.go Put/Append/Get send, server.go handlers，handlers调用Start添加op到Raft log中，这里最好给Start加锁，kvserver等待Raft达成一致，期间需要保持读applyCh，handler继续添加日志到Raft中。Raft通过ApplyCh发送Op command时，Server执行该指令并返回RPC，当Server不是多数派时，不应该返回Put指令，解决方法是，应该同样把Command放在日志中。 
+进行到这一步时，可以继续修改应对网络和服务器失败，Clerk可能会多次发送RPC，Put和Append应该是幂等的，这里可以用序列号实现。 还需要添加代码应对失败，和clerk多次重传的请求，clerk在第一次发送失败并超时后，应该随机选择一个server发送请求。
+当Leader调用Start添加Log后，commit Log之前，它的状态不再为Leader，此时应该告知Clerk重新发送请求给新Leader。实现：查看任期是否改变，或者查看日志中是否有其他任期的新日志，如果前Leader被网络分区了，就没有新Leader的信息，但同一个分区内的client也无法找到新Leader。
+可能需要修改Clerk，保存最后一个RPC返回时的Leader，并向该Leader发送服务请求，可以减少寻找Leader的时间
+需要保证client的operation只执行一次
+重复检测应该快速释放释放server内存，通过rpc告知client已经接收到了之前的所有RPC。
+#### Implementation 
+1. modify client.go, server.go, common.go
+2. Each of key/value server have an associated Raftpeer. 
+3. Clerks send Put(), Append(), Get() RPC to the kvserver whose associated Raft is the peer. 
+4. The kvserver code submits the operation to raft, so raft log holds a sequence of Put/Append/Get operations. 
+   All of the kvserver execute operations from the Raft log in order, applying the operations to their KV database.
+5. If Clerk sends an RPC to wrong kvserver, or if it cannot reach the kvServer, it should retry by sending to different KVserver.
+6. If KVservice commits the operation to its Raft Log (and hence applies the operation to the key/value state machine) the leader reports the result to the Clerk by responding to its RPC.
+7. If the operation failed to commit (for example, if the leader was replaced), the server reports an error, and the Clerk retries with a different server.
+
+### Lab3A Task
+1. implement a solution that works when there are no dropped messages, and no failed servers.
+2. need to add **RPC-sending code** to the Clerk Put/Append/Get methods in client.go, and **implement PutAppend() and Get() RPC handlers** in server.go. These handlers should enter an Op in the Raft log using Start(); 
+3. you should fill in the Op struct definition in server.go so that it describes a Put/Append/Get operation. 
+4. Each server should execute Op commands as Raft commits them, i.e. as they appear on the applyCh. An RPC handler should notice when Raft commits its Op, and then reply to the RPC. You have completed this task when you reliably pass the first test in the test suite: "One client".
+5. After calling Start(), your kvservers will need to **wait for Raft** to complete agreement. Commands that have been agreed upon arrive on the applyCh. Your code will need to **keep reading applyCh while PutAppend() and Get() handlers submit commands to the Raft log using Start()**. Beware of deadlock between the kvserver and its Raft library.
+6. You are allowed to add fields to the Raft ApplyMsg, and to add fields to Raft RPCs such as AppendEntries, however this should not be necessary for most implementations.
+7. **A kvserver should not complete a Get() RPC if it is not part of a majority** (so that it does not serve stale data). A simple solution is to enter every Get() (as well as each Put() and Append()) in the Raft log. 
+8. You don't have to implement the optimization for read-only operations that is described in Section 8.
+9. It's best to **add locking from the start** because the need to avoid deadlocks sometimes affects overall code design. Check that your code is race-free using go test -race.
+10. Now you should modify your solution to continue in the face of network and server failures. One problem you'll face is that a Clerk may have to send an RPC multiple times until it finds a kvserver that replies positively. If a leader fails just after committing an entry to the Raft log, the Clerk may not receive a reply, and thus may re-send the request to another leader. Each call to Clerk.Put() or Clerk.Append() should result in just a single execution, so you will have to ensure that the re-send doesn't result in the servers executing the request twice.
+11. Add code to handle failures, and to cope with duplicate Clerk requests, including situations where the Clerk sends a request to a kvserver leader in one term, times out waiting for a reply, and re-sends the request to a new leader in another term. The request should execute just once. Your code should pass the go test -run 3A -race tests.
+12. Your solution needs to handle **a leader that has called Start() for a Clerk's RPC, but loses its leadership before the request is committed to the log.** In this case you should arrange for the Clerk to re-send the request to other servers until it finds the new leader. One way to do this is for the server to detect that it has lost leadership, by noticing that a different request has appeared at the index returned by Start(), or that Raft's term has changed. If the ex-leader is partitioned by itself, it won't know about new leaders; but any client in the same partition won't be able to talk to a new leader either, so it's OK in this case for the server and client to wait indefinitely until the partition heals.
+13. You will probably have to modify your **Clerk** to **remember which server turned out to be the leader for the last RPC, and send the next RPC to that server first.** This will avoid wasting time searching for the leader on every RPC, which may help you pass some of the tests quickly enough.
+14. You will need to **uniquely identify client operations** to ensure that the key/value service **executes each one just once.**
+15. Your scheme for **duplicate detection** should **free server memory quickly**, for example by having each RPC imply that the client has seen the reply for its previous RPC. It's OK to assume that a client will make only one call into a Clerk at a time.
+
+## Lab3B 
+### Goal
+The tester passes maxraftstate to your StartKVServer(). 
+**maxraftstate** indicates the maximum allowed size of your persistent Raft state in bytes (including the log, but not including snapshots). You should compare maxraftstate to persister.RaftStateSize(). Whenever your key/value server detects that the Raft state size is approaching this threshold, it should save a snapshot using Snapshot, which in turn uses persister.SaveRaftState(). If maxraftstate is -1, you do not have to snapshot. maxraftstate applies to the GOB-encoded bytes your Raft passes to persister.SaveRaftState().
+
+#### Hint
+1. Think about when a kvserver should snapshot its state and what should be included in the snapshot. Raft stores each snapshot in the persister object using SaveStateAndSnapshot(), along with corresponding Raft state. You can read the latest stored snapshot using ReadSnapshot().
+2. Your kvserver must be able to detect duplicated operations in the log across checkpoints, so any state you are using to detect them must be included in the snapshots.
+3. Capitalize all fields of structures stored in the snapshot.
+4. You may have bugs in your Raft library that this lab exposes. If you make changes to your Raft implementation make sure it continues to pass all of the Lab 2 tests.
+5. A reasonable amount of time to take for the Lab 3 tests is 400 seconds of real time and 700 seconds of CPU time. Further, go test -run TestSnapshotSize should take less than 20 seconds of real time.
+###Implementation
+1. Snapshot触发监测：在ApplyHandler操作后，判断maxraftstate和persister.RaftStateSize()的大小。当maxraftstate <= persister.RaftStateSize()时，先准备好snapshot，这里需要确认snapshot所对应的index下标，因此还需要修改applyHandler，需要index参数来调用Snapshot
+2. applyHandler的修改：
+	1. 接收snapshot，即applyMsg中，SnapshotValid 的情况，这里无条件应用snapshot即可，然后需要修改lastAppliedIndex。
+	2. 为了记录service state对应的index，每次应用时应该记录lastAppliedIndex，在生成snapshot时应该用锁。如果接受到lastAppliedIndex之前的请求，不做任何修改，抛弃这个请求。
+3. 问题？lastAppliedIndex是否要持久化？ ClientSeq已经存储了client session，因此在Get，PutAppend中都不需要用到lastAppliedIndex，只有在applyHandler中，判断是否应用操作时需要用到，raft可能会提交一些lastAppliedIndex之前的日志项，需要靠lastAppliedIndex把这些日志项去除，因此我的实现中，需要会把lastAppliedIndex和snapshot一起持久化。
+4. Snapshot的序列化和反序列化： 和raft一致。
+5. 为什么需要存储lastAppliedIndex，已经包含在快照中的请求不能被再次执行。
+6. raft 节点实现了怎样的功能？生成快照以后，raft 节点不会再提交lastAppliedIndex之前的LogEntry。
+7. 为什么还是会有快照中的日志项提交？因为snapshot和logEntry都采用rf.applyCh向上传递，LogEntry是通过一个go routine周期性的判断commitIndex和lastApplied之间是否有需要apply的日志，而snapshot是通过installsnapshot接收并向上传递，无法控制传递的先后顺序，需要上层服务来判断是否应用。（只有在snapShot被apply之后，raft中lastIncludedTerm和lastIncludedIndex更新，此时……）
+8. server崩溃重启后，lastIncludedTerm和lastIncludedIndex仍然存在raft peer中，因此他们不会提交这之前的日志。
+
+
 
 # Lab 2 Raft
 Paper: [In Search of an Understandable Consensus Algorithm(Extended Version)](obsidian://booknote?type=annotation&book=MIT%206.824/raft-extended.pdf&id=854b8c2c-6088-8e6d-244c-d126d6bec6d6&page=1&rect=111.240,678.770,508.139,716.107)
@@ -143,6 +203,7 @@ ou'll modify Raft to cooperate to save space: from time to time a service will p
 
 To support snapshots, we need an interface between the service and the Raft library. 
 To allow for a simple implementation, we decided on the following interface between service and Raft
+
 ```
 Snapshot(index int, snapshot []byte)
 CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int, snapshot []byte) bool
@@ -191,19 +252,6 @@ Leader发送InstallSnapShot的实现
 3. Raft peer的日志都是1-based index，index = 0处的日志项无意义，在不裁剪日志的情况下，日志数组rf.Log的下标arrayIndex和实际的下标index相同。 引入快照机制以后，当arrayIndex > 0 时，日志项rf.Log[arrayIndex]对应的下标index = rf.lastIncludedIndex + arrayIndex，但当我们需要获取arrayindex = 0处日志项的信息时，应该返回rf.lastLogIndex和rf.lastLogTerm。
    例如，（Leader发送AppendEntries RPC给Follower，需要设置args.prevLogIndex = rf.nextIndex[server] - 1，但此时Leader.nextIndex[followerID] = Follower.Log[1]），Follower接收到AppendEntries RPC后，寻找args.PrevLogIndex对应的日志项Entry，比较args.PrevLogTerm和Entry.Term。因此Follower会根据arrayIndex = args.prevLogIndex - rf.lastIncludedIndex得到arrayIndex = 0，找到rf.Log[0] ，但rf.Log[0]是无意义的，此时应该返回rf.Log[1]日志项前一项的数据，即rf.prevLogIndex和rf.prevLogTerm来匹配。
    实现：在Lab2B中，最好就不要使用rf.Log[index]来获取下标为index的日志，转而实现一个rf.getLogAt(arrayIndex)的方法，先获取对应日志项在日志列表rf.Log[]中的数组下标arrayIndex，根据arrayIndex = TargetIndex - rf.lastIncludedIndex计算，再用ra.getLogAt(arrayIndex)获取信息，当arrayIndex = 0时，返回rf.lastIncludedIndex, rf.lastIncludedTerm
-   ```go
-   // Input: arrayIndex of LogEntry
-   // Output: exist, LogEntry.Index, LogEntry.Term
-	func (rf *Raft) getLogAt(realIndex int) (bool, int, int) {
-		if realIndex >= len(rf.Log) {
-			return false, -1, -1
-		} else if realIndex == 0 {
-			return true, rf.lastIncludedIndex, rf.lastIncludedTerm
-		} else {
-			return true, rf.Log[realIndex].Index, rf.Log[realIndex].Term
-		}
-	}
-```
 4. InstallSnapshot和fast back-up的兼容 
    未引入快照机制时，使用课上介绍的方法，向AppendEntriesReply中添加XTerm, XIndex, XLen信息
    当接收到来自Follower的AppendEntriesArgs时，包含args.PrevLogIndex, args.PrevLogTerm
