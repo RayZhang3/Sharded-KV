@@ -1,60 +1,138 @@
+# MIT 6.824 
+[MIT 6.824](http://nil.csail.mit.edu/6.824/2021/) is a graduate-level distributed systems course offered by MIT. This course deeply explores the design and implementation principles of distributed systems, covering topics such as fault tolerance mechanisms, consensus algorithms, data replication, consistency models, distributed storage systems, and MapReduce. Through lectures, paper readings, and programming assignments, the content mainly includes how to build high-performance, scalable, and reliable distributed systems, cultivating theoretical knowledge and practical skills in the field of distributed systems.
+
+Here is [CN version of my note](https://github.com/RayZhang3/Sharded-KV/blob/master/README_CN.md)
+
 # ShardKV
-shardKV 是multi-raft的实现，一个raft节点对应一个状态机，多个raft节点组成一个raft组，多个raft组和配置管理服务器共同提供服务。但这里缺少了物理节点的概念，在实际的生产系统中，不同raft组的成员可能存在于同一个物理节点上，一个物理节点拥有一个状态机，不同raft组使用不同的命名空间操作同一个状态机。
-### 功能
-对内：
-	负载均衡（使切片在服务期间均匀分布，但未考虑请求）
-	一定程度的容错
-	分片数据的动态迁移
-	分片独立提供服务: 可以独立地迁移分片，在分片迁移时，不影响未迁移分片的读写请求，比如，raft组需要从两个组拉取数据，其中一个raft组挂了或者正在重启，不会影响另一个组的数据拉取）
-对外： 
-	提供键值服务，具有[线性一致性的特性](https://zhuanlan.zhihu.com/p/42239873)
-系统的运行方式是：一开始创建一个shardctrler负责配置更新、分片分配等任务，紧接着创建多个raft组承载分片的读写任务，可能有raft组增删、raft节点宕机、raft节点重启、网络分区的情况出现。
-### 实现
-1. 变更配置的过程：需要更新配置、移动分片，移动分片可以分解为拉取分片和确认收到分片。键值服务中的PUT、APPEND，这些都是涉及到集群分片状态和数据的操作，为保证raft组内的状态一致，都需要组内的Leader通过raft日志的方式提交。 
-2. 异步变更配置：实现分片的独立服务，单个分片传输完成后可以立即提供服务，不需要进行分片迁移的分组可以正常提供服务，比同步变更配置的方式性能更好。（同步变更配置：为了保证分片的数据在更新配置期间不变，原raft组在获取到新配置后需要阻塞applier，直到分片全部传输完毕后再提供服务）异步变更配置时，只应该变更分片状态，由异步的分片传输协程完成剩余的工作。
-3. 更新配置的过程：raft组的leader确认自身的日志状态，这里设置了四种日志状态，不涉及分片迁移的SERVING, NO_SERVING, 分片迁移状态下的PULLING, BEPULLED。为了防止分片状态被覆盖，仅当上一轮日志迁移已经完成时，再拉取当前配置的下一个配置，并更新分片状态。
-4. 分片传输过程：设计了两组RPC，一组负责请求对应的分片，一组用于确认接收方是否接收到分片，为了实现操作的幂等性，调用参数需要附上配置的版本号。这两个协程在raft节点处于leader状态时唤醒。检测到分片处于PULLING状态时，向上一个持有该分片的raft组发送请求。这里的分片传输过程实际上是状态转移，状态不仅包括对应分片的数据，也包括用于去重的客户端序列号映射，这里无法判断分片数据对应的写入客户端，因此我的实现中是发送分片数据、存储客户端和序列号映射的map给接收方，接收方检查配置版本号和分片状态，接收分片数据，并更新客户端序列号，把对应的分片状态变更为Serving。
-5. 确认分片接收过程：检测到分片处于BEPULLED的状态时，向此配置下应持有该分片的raft组发送请求，接收方在两种情况下确认，一是自身配置号大于调用参数，二是配置号相等，且对应分片已经开始处理数据。（出现自身配置号大于参数的情况是因为，接收方接收到分片以后，已经开始提供服务，接收所有分片后可能开始新一轮的配置更新）
-6. 持久化：raft和kvserver引入了快照机制，在检测到日志占用空间过大时，将保存当前KVServer的状态和raft层的日志及一部分状态变量Encode并保存到磁盘中，恢复时再Decode。KVServer的状态信息包括了分片的键值数据、用于去重的客户端请求序列号、分片状态、此前配置和当前配置（需要依靠配置进行分片传输和确认）。
+
+ShardKV is an implementation of multi-raft, where each raft node corresponds to a state machine. Multiple raft nodes form a raft group, and multiple raft groups along with a configuration management server provide services. However, the concept of a physical node is missing here. In actual production systems, members of different raft groups may exist on the same physical node. A physical node owns a state machine, and different raft groups operate on the same state machine using different namespaces.
+
+### Features
+
+**Internal:**
+
+- Load balancing (makes shards evenly distributed during service, but does not consider requests)
+- A certain degree of fault tolerance
+- Dynamic migration of shard data
+- **Independent shard services**: Shards can be migrated independently without affecting read and write requests of shards not being migrated. For example, if a raft group needs to pull data from two groups, and one raft group crashes or is restarting, it does not affect data pulling from the other group.
+
+**External:**
+
+- Provides key-value services with [linearizability properties](https://hongilkwon.medium.com/what-is-linearizability-in-distributed-system-db8bca3d432d#:~:text=Linearizability%20is%20the%20strongest%20consistency,operations%20on%20it%20are%20atomic)
+
+
+The system operates as follows: Initially, a `shardctrler` is created to handle configuration updates, shard allocation, and other tasks. Then, multiple raft groups are created to handle the read and write tasks of shards. Situations such as raft group addition or deletion, raft node crashes, raft node restarts, and network partitions may occur.
+
+### Implementation
+
+1. **Configuration Change Process**: Requires updating configurations and moving shards, which can be decomposed into pulling shards and confirming receipt of shards. Operations like `PUT` and `APPEND` in the key-value service involve cluster shard states and data operations. To ensure consistency within the raft group, the leader in the group needs to commit these through the raft log.
+
+2. **Asynchronous Configuration Changes**: Implements independent shard services where a single shard can immediately provide services after transfer completion. Groups not undergoing shard migration can continue to provide services normally, offering better performance than synchronous configuration changes.
+
+   - **Synchronous Configuration Changes**: To ensure that shard data remains unchanged during configuration updates, the original raft group needs to block the applier after obtaining the new configuration and only provide services after all shard transfers are completed.
+   - **Asynchronous Configuration Changes**: Only the shard state should be changed, and the remaining work is completed by asynchronous shard transfer goroutines.
+
+3. **Configuration Update Process**: The leader of the raft group confirms its own log state. Four log states are set: `SERVING`, `NO_SERVING`, `PULLING` during shard migration, and `BEPULLED`. To prevent shard states from being overwritten, the next configuration is pulled and shard states are updated only after the previous round of log migration is complete.
+
+4. **Shard Transfer Process**: Two sets of RPCs are designed:
+
+   - One responsible for requesting the corresponding shards
+   - One for confirming whether the receiver has received the shards
+
+   To achieve idempotent operations, the call parameters need to include the configuration version number. These two goroutines are awakened when the raft node is in the leader state. When detecting that a shard is in the `PULLING` state, it sends a request to the previous raft group that held the shard. The shard transfer process is essentially a state transition; the state includes not only the data of the corresponding shard but also the client sequence number mapping used for deduplication. Since it's impossible to determine which client the shard data corresponds to, in my implementation, the shard data and the map storing client IDs and sequence numbers are sent to the receiver. The receiver checks the configuration version number and shard state, receives the shard data, updates the client sequence numbers, and changes the corresponding shard state to `Serving`.
+
+5. **Shard Receipt Confirmation Process**: When detecting that a shard is in the `BEPULLED` state, it sends a request to the raft group that should hold the shard under this configuration. The receiver confirms in two situations:
+
+   - Its own configuration number is greater than the call parameter
+   - The configuration numbers are equal, and the corresponding shard has already started processing data
+
+   *(The situation where the receiver's configuration number is greater than the parameter occurs because, after receiving the shard, it has already started providing services, and after receiving all shards, it may start a new round of configuration updates.)*
+
+6. **Persistence**: Raft and KVServer introduce a snapshot mechanism. When the log occupies too much space, the current state of KVServer and the raft layer's logs, along with some state variables, are encoded and saved to disk. Upon recovery, they are decoded. The state information of KVServer includes:
+
+   - The key-value data of shards
+   - Client request sequence numbers used for deduplication
+   - Shard states
+   - Previous and current configurations (necessary for shard transfer and confirmation)
 
 ## Shardctrler
-概念：高可用集群配置管理服务，记录了当前每个raft组对应的副本，其中节点的endpoint, 以及每个shard被分配到了哪个Raft组。
-功能：
-基于分片实现基本的负载均衡，
-用户手动或内置策略自动的方式来删除raft组，更有效地利用集群资源。 
-客户端的每个请求都可以通过shardctrler路由到正确的数据节点，类似于HDFS master的角色。
-优化：客户端缓存配置，例如，保存对应的shard到leader 服务器的映射，在请求出错时，ErrorWrongLeader时访问集群内的其他服务器，一定次数后重新获取配置，ErrWrongGroup则重新获取配置。
-### 实现
-主要有Join、Leave、Query、Move四个api，Query可以获取指定标号的配置，Move则是将Shard分配给指定的Group，Join和Leave，由于shards不变，因此在移动后需要进行rebalance。我的实现思路是：首先遍历所有Shards，收集成freeShards，然后开始进入循环，依次找到shards数量最多的组和shards数量最少的组，优先把freeShards分配给最少的组，如果没有freeShards，就把shards最多的组管理的一个shards分配给shards最少的组，循环直到最大和最小的差值小于等于1。这里需要注意的点是，由于shardctrler存储的是GroupID -> servers（集群号到集群各个服务器终端地址的映射），需要遍历GroupID。根据复制状态机的原理，每个副本都是状态机的实现，而且都是确定状态机，给定相同的日志，在不同的副本上应该得到一样的结果。由于go中遍历map的次序是不确定的，而shardctrler本身也是基于raft实现，需要保证leader和follwer执行相同日志后得到同样的状态，因此需要确定一个遍历顺序，我的做法是，首先遍历所有GroupID，形成一个排序，在这一次负载均衡的操作中均使用这个排序去访问不同的GID并移动分片。
 
+**Concept**: A highly available cluster configuration management service that records the replicas corresponding to each raft group, including the endpoints of the nodes, and which shard is allocated to which raft group.
+
+**Features**:
+
+- Achieves basic load balancing based on shards
+- Allows users to manually or automatically delete raft groups using built-in strategies, making more efficient use of cluster resources
+- Each client request can be routed to the correct data node through `shardctrler`, similar to the role of the HDFS master
+
+**Optimization**: Clients cache configurations—for example, saving the mapping of shards to leader servers. When a request error occurs, upon `ErrorWrongLeader`, they access other servers in the cluster. After a certain number of attempts, they retrieve the configuration again. Upon `ErrWrongGroup`, they retrieve the configuration again.
+
+### Implementation
+
+There are mainly four APIs: `Join`, `Leave`, `Query`, and `Move`. `Query` can get the configuration of a specified number, and `Move` assigns a shard to a specified group. Since shards remain unchanged during `Join` and `Leave`, rebalancing is needed after moving. My implementation idea is:
+
+- First, traverse all shards to collect them into `freeShards`.
+- Then enter a loop, sequentially finding the group with the most shards and the group with the least shards.
+- Preferentially assign `freeShards` to the group with the least shards.
+- If there are no `freeShards`, assign one shard managed by the group with the most shards to the group with the least shards.
+- Loop until the maximum and minimum difference is less than or equal to 1.
+
+One point to note here is that since `shardctrler` stores `GroupID -> servers` (a mapping from cluster IDs to the endpoints of servers in the cluster), it needs to traverse `GroupID`. According to the principle of replicated state machines, each replica is an implementation of a state machine, and they are deterministic state machines; given the same logs, the same results should be obtained on different replicas. Since the order of traversal of maps in Go is non-deterministic, and `shardctrler` itself is implemented based on Raft, it needs to ensure that after the leader and follower execute the same logs, they get the same state. Therefore, a deterministic traversal order is needed. My approach is to first traverse all `GroupID` to form a sorted order, and in this load balancing operation, use this sorted order to access different `GID` and move shards.
 
    
-# Lab 4(ShardKV)
-## 参考 
+# Lab 4 (ShardKV)
+
+## References
+
 Architecture: https://github.com/OneSizeFitsQuorum/MIT6.824-2021/blob/master/docs/lab4.md
-优化部分(主要是Lease Read): https://ray-eldath.me/programming/deep-dive-in-6824/ 
 
-## 优化
-1. 优化只读请求。目前的read是通过raft log实现的，这是课程Lab要求的实现方式。可以通过以下几种方式优化，
-	1. ReadIndex：先记录当前ReadIndex，发送心跳确认自己是leader（减少复制日志的开销），等待lastApplied > readIndex时返回结果。把复制日志的开销变为发送心跳。leader刚当选时需要发送一条No-Op来提交之前的所有log。
-	2. LeaseRead：Leader在发送心跳之前记录时间，在发送心跳确认自己得到大多数Follower的回应后(即大多数节点不会竞选成为新的节点)，延长它的租约，在租约期间无需再次发送heartbeat确认自己的leader身份，租约到期后自动变为follower。该方法性能最好，节省了发送心跳的过程。但该方案对时钟的准确性要求高，可能导致出现两个Leader的情况。
-   ETCD的raft层基于readIndex，但可以切换至leaseRead
-	Lease Read 和ReadIndex的共同点：是Leader接收到读请求的时候，当前的commit Index。Leader在保证大多数节点到达该commit Index后，就可以向这个读请求返回数据了。
-2. 为什么ReadIndex需要等待 本地的lastApplied >= readIndex?  会破坏线性一致性。
-3. 为什么在ReadIndex中，刚选出的Leader需要写一条No-Op？(Leader apply) 
-概括：Leader apply日志项并且回复了client的请求，但commitIndex还没来得及发送给follower，followers不知道leader已经commit了，不知道当前commitindex的进度，因此可能会返回旧数据。
+Optimization (mainly Lease Read): https://ray-eldath.me/programming/deep-dive-in-6824/
 
+## Optimization
 
-# Lab3
+1. **Optimizing Read-Only Requests**. Currently, reads are implemented via the Raft log, which is the required implementation for the course Lab. There are several ways to optimize this:
+
+   1. **ReadIndex**: First, record the current `ReadIndex`, send a heartbeat to confirm itself as the leader (reducing the overhead of log replication), and wait until `lastApplied > readIndex` before returning the result. This changes the overhead of log replication to sending heartbeats. When the leader is newly elected, it needs to send a No-Op to commit all previous logs.
+
+   2. **Lease Read**: Before sending a heartbeat, the leader records the time. After sending a heartbeat and confirming that it has received responses from the majority of followers (i.e., the majority of nodes will not elect a new leader), it extends its lease. During the lease period, there is no need to send heartbeats again to confirm its leadership; after the lease expires, it automatically becomes a follower. This method has the best performance and saves the process of sending heartbeats. However, this scheme requires high clock accuracy and may lead to the situation of having two leaders.
+
+      The Raft layer of ETCD is based on ReadIndex but can switch to Lease Read.
+
+      **Commonality between Lease Read and ReadIndex**: When the leader receives a read request, it is at the current commit index. Once the leader ensures that the majority of nodes have reached this commit index, it can return data for this read request.
+
+2. **Why does ReadIndex need to wait until the local `lastApplied >= readIndex`?** It would break linearizability.
+
+3. **Why does the newly elected leader need to write a No-Op in ReadIndex? (Leader apply)**
+
+   **Summary**: The leader applies log entries and replies to the client's request, but the `commitIndex` has not been sent to followers in time. Followers do not know that the leader has committed, nor do they know the progress of the current `commitIndex`, so they may return stale data.
+
+# Lab 3
+
 ## Goals
-Lab3需要实现的部分： Clerk machine和service/state machine replica 的交互，clerk和Server有RPC的交互，包括get, put, append
-Service为Clerk的这些指令提供强一致性，对于并行的请求，返回值和系统状态应该和特定顺序下串行执行一致，RPC调用应该能看到之前所有RPC调用的影响。
-代码部分：client.go Put/Append/Get send, server.go handlers，handlers调用Start添加op到Raft log中，这里最好给Start加锁，kvserver等待Raft达成一致，期间需要保持读applyCh，handler继续添加日志到Raft中。Raft通过ApplyCh发送Op command时，Server执行该指令并返回RPC，当Server不是多数派时，不应该返回Put指令，解决方法是，应该同样把Command放在日志中。 
-进行到这一步时，可以继续修改应对网络和服务器失败，Clerk可能会多次发送RPC，Put和Append应该是幂等的，这里可以用序列号实现。 还需要添加代码应对失败，和clerk多次重传的请求，clerk在第一次发送失败并超时后，应该随机选择一个server发送请求。
-当Leader调用Start添加Log后，commit Log之前，它的状态不再为Leader，此时应该告知Clerk重新发送请求给新Leader。实现：查看任期是否改变，或者查看日志中是否有其他任期的新日志，如果前Leader被网络分区了，就没有新Leader的信息，但同一个分区内的client也无法找到新Leader。
-可能需要修改Clerk，保存最后一个RPC返回时的Leader，并向该Leader发送服务请求，可以减少寻找Leader的时间
-需要保证client的operation只执行一次
-重复检测应该快速释放释放server内存，通过rpc告知client已经接收到了之前的所有RPC。
+
+Lab 3 requires implementing the interaction between the Clerk machine and the service/state machine replica. The clerk and server interact via RPCs, including `get`, `put`, and `append`.
+
+The service provides strong consistency for these clerk commands. For concurrent requests, the return values and system state should be consistent with some sequential execution in a specific order, and RPC calls should be able to see the effects of all previous RPC calls.
+
+**Code Components**:
+
+- In `client.go`, implement `Put`/`Append`/`Get` send functions.
+- In `server.go`, implement handlers. Handlers call `Start` to add `op` to the Raft log. It's best to lock `Start` here.
+- The `kvserver` waits for Raft to reach consensus; during this period, it needs to keep reading `applyCh`.
+- Handlers continue to add logs to Raft.
+- When Raft sends an `Op` command through `applyCh`, the server executes the command and returns RPC.
+- When the server is not part of the majority, it should not return the `Put` command. The solution is to also put the command into the log.
+
+At this point, we can continue to modify the code to handle network and server failures. The clerk may send RPCs multiple times; `Put` and `Append` should be idempotent, which can be achieved using sequence numbers. We also need to add code to handle failures and multiple retransmissions of requests by the clerk. If the clerk fails to send the first time and times out, it should randomly select a server to send the request.
+
+When the leader calls `Start` to add a log, but before the log is committed, its state changes and it is no longer the leader. At this point, it should inform the clerk to resend the request to the new leader. **Implementation**: Check whether the term has changed, or whether there are new logs with other terms in the log. If the previous leader is network partitioned, there is no information about the new leader, but clients in the same partition cannot find the new leader either.
+
+We may need to modify the clerk to save the leader from the last RPC return and send service requests to that leader, which can reduce the time to find the leader.
+
+We need to ensure that the client's operation is executed only once.
+
+Duplicate detection should quickly release server memory; notify the client via RPC that all previous RPCs have been received.
+
 #### Implementation 
 1. modify client.go, server.go, common.go
 2. Each of key/value server have an associated Raftpeer. 
@@ -88,56 +166,94 @@ The tester passes maxraftstate to your StartKVServer().
 **maxraftstate** indicates the maximum allowed size of your persistent Raft state in bytes (including the log, but not including snapshots). You should compare maxraftstate to persister.RaftStateSize(). Whenever your key/value server detects that the Raft state size is approaching this threshold, it should save a snapshot using Snapshot, which in turn uses persister.SaveRaftState(). If maxraftstate is -1, you do not have to snapshot. maxraftstate applies to the GOB-encoded bytes your Raft passes to persister.SaveRaftState().
 
 #### Hint
-1. Think about when a kvserver should snapshot its state and what should be included in the snapshot. Raft stores each snapshot in the persister object using SaveStateAndSnapshot(), along with corresponding Raft state. You can read the latest stored snapshot using ReadSnapshot().
-2. Your kvserver must be able to detect duplicated operations in the log across checkpoints, so any state you are using to detect them must be included in the snapshots.
+
+1. Think about when a `kvserver` should snapshot its state and what should be included in the snapshot. Raft stores each snapshot in the persister object using `SaveStateAndSnapshot()`, along with corresponding Raft state. You can read the latest stored snapshot using `ReadSnapshot()`.
+2. Your `kvserver` must be able to detect duplicated operations in the log across checkpoints, so any state you are using to detect them must be included in the snapshots.
 3. Capitalize all fields of structures stored in the snapshot.
-4. You may have bugs in your Raft library that this lab exposes. If you make changes to your Raft implementation make sure it continues to pass all of the Lab 2 tests.
-5. A reasonable amount of time to take for the Lab 3 tests is 400 seconds of real time and 700 seconds of CPU time. Further, go test -run TestSnapshotSize should take less than 20 seconds of real time.
-###Implementation
-1. Snapshot触发监测：在ApplyHandler操作后，判断maxraftstate和persister.RaftStateSize()的大小。当maxraftstate <= persister.RaftStateSize()时，先准备好snapshot，这里需要确认snapshot所对应的index下标，因此还需要修改applyHandler，需要index参数来调用Snapshot
-2. applyHandler的修改：
-	1. 接收snapshot，即applyMsg中，SnapshotValid 的情况，这里无条件应用snapshot即可，然后需要修改lastAppliedIndex。
-	2. 为了记录service state对应的index，每次应用时应该记录lastAppliedIndex，在生成snapshot时应该用锁。如果接受到lastAppliedIndex之前的请求，不做任何修改，抛弃这个请求。
-3. 问题？lastAppliedIndex是否要持久化？ ClientSeq已经存储了client session，因此在Get，PutAppend中都不需要用到lastAppliedIndex，只有在applyHandler中，判断是否应用操作时需要用到，raft可能会提交一些lastAppliedIndex之前的日志项，需要靠lastAppliedIndex把这些日志项去除，因此我的实现中，需要会把lastAppliedIndex和snapshot一起持久化。
-4. Snapshot的序列化和反序列化： 和raft一致。
-5. 为什么需要存储lastAppliedIndex，已经包含在快照中的请求不能被再次执行。
-6. raft 节点实现了怎样的功能？生成快照以后，raft 节点不会再提交lastAppliedIndex之前的LogEntry。
-7. 为什么还是会有快照中的日志项提交？因为snapshot和logEntry都采用rf.applyCh向上传递，LogEntry是通过一个go routine周期性的判断commitIndex和lastApplied之间是否有需要apply的日志，而snapshot是通过installsnapshot接收并向上传递，无法控制传递的先后顺序，需要上层服务来判断是否应用。（只有在snapShot被apply之后，raft中lastIncludedTerm和lastIncludedIndex更新，此时……）
-8. server崩溃重启后，lastIncludedTerm和lastIncludedIndex仍然存在raft peer中，因此他们不会提交这之前的日志。
+4. You may have bugs in your Raft library that this lab exposes. If you make changes to your Raft implementation, make sure it continues to pass all of the Lab 2 tests.
+5. A reasonable amount of time to take for the Lab 3 tests is 400 seconds of real time and 700 seconds of CPU time. Further, `go test -run TestSnapshotSize` should take less than 20 seconds of real time.
 
+### Implementation
 
+1. **Snapshot Trigger Monitoring**: After the `ApplyHandler` operation, compare `maxraftstate` with `persister.RaftStateSize()`. When `maxraftstate <= persister.RaftStateSize()`, prepare the snapshot. You need to confirm the index corresponding to the snapshot, so you need to modify `applyHandler` to include an index parameter to call `Snapshot`.
+
+2. **Modifications to `applyHandler`**:
+   1. **Receiving a Snapshot**: In the case where `SnapshotValid` is true in `applyMsg`, apply the snapshot unconditionally and then update `lastAppliedIndex`.
+   2. **Recording the Service State Index**: Each time an operation is applied, record `lastAppliedIndex`. You should use a lock when generating a snapshot. If you receive a request before `lastAppliedIndex`, do not make any changes and discard the request.
+
+3. **Question**: Does `lastAppliedIndex` need to be persisted? Since `ClientSeq` already stores the client session, `lastAppliedIndex` is not needed in `Get` and `PutAppend`. It is only used in `applyHandler` to determine whether to apply an operation. Raft may commit some log entries before `lastAppliedIndex`; we need to use `lastAppliedIndex` to filter out these entries. Therefore, in my implementation, I persist `lastAppliedIndex` along with the snapshot.
+
+4. **Serialization and Deserialization of Snapshots**: Same as in Raft.
+
+5. **Why Do We Need to Store `lastAppliedIndex`**: Requests already included in the snapshot should not be executed again.
+
+6. **What Functionality Does the Raft Node Implement?** After generating a snapshot, the Raft node will not commit `LogEntry` entries before `lastAppliedIndex`.
+
+7. **Why Are Log Entries Already in the Snapshot Still Being Committed?** Because both snapshots and log entries use `rf.applyCh` to pass upwards. `LogEntry` entries are applied through a goroutine that periodically checks whether there are logs between `commitIndex` and `lastApplied` that need to be applied. Snapshots are received and passed upwards through `InstallSnapshot`. We cannot control the order in which they are passed, so the upper-layer service needs to determine whether to apply them. *(Only after the snapshot is applied do `lastIncludedTerm` and `lastIncludedIndex` in Raft get updated...)*
+
+8. **After Server Crash and Restart**: `lastIncludedTerm` and `lastIncludedIndex` still exist in the Raft peer, so they will not commit logs before these indices.
+
+---
 
 # Lab 2 Raft
-Paper: [In Search of an Understandable Consensus Algorithm(Extended Version)](obsidian://booknote?type=annotation&book=MIT%206.824/raft-extended.pdf&id=854b8c2c-6088-8e6d-244c-d126d6bec6d6&page=1&rect=111.240,678.770,508.139,716.107)
+
+Paper: [In Search of an Understandable Consensus Algorithm (Extended Version)](https://raft.github.io/raft.pdf)
+
+
 Diagram of Raft Structure: https://pdos.csail.mit.edu/6.824/notes/raft_diagram.pdf
+
 6.824 Lab Guidance: [Guidance](https://pdos.csail.mit.edu/6.824/labs/guidance.html)
-6.824 Debugging by printing: [Debug Guide](https://blog.josejg.com/debugging-pretty/)
+
+6.824 Debugging by Printing: [Debug Guide](https://blog.josejg.com/debugging-pretty/)
+
 Raft Lab Guide: https://thesquareplanet.com/blog/students-guide-to-raft/
+
 Raft Q&A: https://thesquareplanet.com/blog/raft-qa/
+
 Raft-Locking: https://pdos.csail.mit.edu/6.824/labs/raft-locking.txt
+
 Raft-Structure: https://pdos.csail.mit.edu/6.824/labs/raft-structure.txt
+
 ## Lab 2A
+
 ### Implementation
-1. Election resrtiction
-   [5.4.1 Election restriction](obsidian://booknote?type=annotation&book=MIT%206.824/raft-extended.pdf&id=f9beb2cf-c15a-6e5b-1a19-c02ed5ff2c56&page=8&rect=72.000,182.865,183.499,191.833) 
-   [gitbook 7.2 选举约束（Election Restriction）](https://mit-public-courses-cn-translatio.gitbook.io/mit6-824/lecture-07-raft2/7.2-xuan-ju-yue-shu-election-restriction)
-	节点只能向满足以下条件之一的候选人投出赞成票：以Log为准，和候选人持有的term无关。
-	候选人最后一条Log条目的任期号大于本地最后一条Log条目的任期号；
-	或者，候选人最后一条Log条目的任期号等于本地最后一条Log条目的任期号，且候选人的Log记录长度大于等于本地Log记录的长度
-2. Log Backup
-   [gitbook 7.1 日志恢复](https://mit-public-courses-cn-translatio.gitbook.io/mit6-824/lecture-07-raft2/7.1)
-   Leader总是有完整的记录
-   Leader发送给Follwer的AppendEntries RPC包含了prevLogIndex和prevLogTerm字样，就是包括了新Entry写入位置的前一个槽位的信息，只有两者都匹配的情况下Follwer才会接收，在匹配的情况下，如果新Entry写入位置已经存有其他任期号的Log，则会该Log和之后的所有Log都会被替换。[Conflit](obsidian://booknote?type=annotation&book=MIT%206.824/raft-extended.pdf&id=df293ef7-f1ae-4f12-96a4-17ee0318836b&page=4&rect=110.316,173.242,191.385,181.355)
-	不匹配时，Leader会将自己维护的nextIndex[]中对应的nextIndex - 1，新的RPC中prevLogindex和prevLogTerm将会往前更新，包含了之前prevLogIndex之后的所有条目。
-3. Fast Backup
-	[gitbook 7.3 快速恢复](https://mit-public-courses-cn-translatio.gitbook.io/mit6-824/lecture-07-raft2/7.3-hui-fu-jia-su-backup-acceleration)
-	对于上述不匹配的情况，可以让Follower返回足够的信息给Leader，这样Leader可以以任期（Term）为单位来回退，而不用每次只回退一条Log条目。这样，Leader只需要对每个不同的任期发送一条AppendEntries，而不用对每个不同的Log条目发送一条AppendEntries。
-	实现：Leader从当前日志开始往前搜索，直到任期号改变，一次往前搜索相同任期号内的所有日志。
-	**课程中的实现方法**：由Follower fail返回相关信息
-	Follower：
-	XTerm：（与prevLogIndex对应的，Follower对应Index中的日志）这个是Follower中与Leader冲突的Log对应的任期号。在之前（7.1）有介绍Leader会在prevLogTerm中带上本地Log记录中，前一条Log的任期号。如果Follower在对应位置的任期号不匹配，它会拒绝Leader的AppendEntries消息，并将自己的任期号放在XTerm中。如果Follower在对应位置没有Log，那么这里会返回 -1。
-	XIndex：（prevLogIndex对应的Log存在，相同term的第一条log）这个是Follower中，对应任期号为XTerm的第一条Log条目的槽位号。
-	XLen：（prevLogIndex对应的Log不存在）如果Follower在对应位置没有Log，那么XTerm会返回-1，XLen表示空白的Log槽位数（包括PrevLogIndex对应的Log，不包括Leader想同步的最新Log）
+
+1. **Election Restriction**
+
+   [GitBook 7.2 Election Restriction(CN)](https://mit-public-courses-cn-translatio.gitbook.io/mit6-824/lecture-07-raft2/7.2-xuan-ju-yue-shu-election-restriction)
+
+   A node can only vote for a candidate who meets one of the following conditions, based on the logs and regardless of the candidate's term:
+
+   - The candidate's last log entry's term is greater than the term of the voter's last log entry;
+   - Or, the candidate's last log entry's term is equal to the term of the voter's last log entry, and the candidate's log is at least as long as the voter's log.
+
+2. **Log Backup**
+
+   [GitBook 7.1 Log Recovery(CN)](https://mit-public-courses-cn-translatio.gitbook.io/mit6-824/lecture-07-raft2/7.1)
+
+   The leader always has the complete log.
+
+   The `AppendEntries` RPC that the leader sends to the follower includes `prevLogIndex` and `prevLogTerm`, which provide information about the log entry immediately preceding the new entries. The follower will only accept the new entries if both match. If they match and the new entry position already contains logs of other terms, those logs and all subsequent logs will be replaced. [Conflict](obsidian://booknote?type=annotation&book=MIT%206.824/raft-extended.pdf&id=df293ef7-f1ae-4f12-96a4-17ee0318836b&page=4&rect=110.316,173.242,191.385,181.355)
+
+   If they do not match, the leader will decrement the corresponding `nextIndex[]` by 1. In the new RPC, `prevLogIndex` and `prevLogTerm` will be updated backward, including all entries after the previous `prevLogIndex`.
+
+3. **Fast Backup**
+
+   [GitBook 7.3 Backup Acceleration(CN)](https://mit-public-courses-cn-translatio.gitbook.io/mit6-824/lecture-07-raft2/7.3-hui-fu-jia-su-backup-acceleration)
+
+   For the mismatch situation described above, the follower can return enough information to the leader so that the leader can backtrack by term units instead of one log entry at a time. This way, the leader only needs to send one `AppendEntries` for each different term, rather than one for each different log entry.
+
+   **Implementation**: The leader searches backward from the current log until the term changes, effectively skipping all entries within the same term in one go.
+
+   **Implementation Method in the Course**: The follower returns relevant information upon failure.
+
+   **Follower**:
+
+   - **XTerm**: (The term of the log at the `prevLogIndex` in the follower's log) This is the term of the conflicting log in the follower that conflicts with the leader. Previously (Section 7.1), it was mentioned that the leader includes the term of the previous log in `prevLogTerm`. If the follower's term at the corresponding position does not match, it will reject the leader's `AppendEntries` message and put its own term into `XTerm`. If the follower does not have a log at the corresponding position, it returns `-1` here.
+
+   - **XIndex**: (If `prevLogIndex` exists, the index of the first log of the same term) This is the index of the first log entry in the follower with term equal to `XTerm`.
+
+   - **XLen**: (If `prevLogIndex` does not exist) If the follower does not have a log at the corresponding position, `XTerm` will return `-1`. `XLen` indicates the number of empty log slots (including the log at `prevLogIndex`, but not including the new log the leader wants to synchronize).
 
 ## Lab 2B
 ### Implementation
@@ -148,56 +264,98 @@ Raft-Structure: https://pdos.csail.mit.edu/6.824/labs/raft-structure.txt
 5. Your code may have loops that repeatedly check for certain events. Don't have these loops execute continuously without pausing, since that will slow your implementation enough that it fails tests. Use Go's condition variables, or insert a time.Sleep(10 * time.Millisecond) in each loop iteration. [cond](https://golang.org/pkg/sync/#Cond)
 6. If you fail a test, look over the code for the test in config.go and test_test.go to get a better understanding what the test is testing. config.go also illustrates how the tester uses the Raft API.
 
-### Fast BackUp
-#### 总结
-1. Raft的日志复制不完全可靠，当Leader在任期内发送日志条目时，可能出现发送失败、发送部分后失败等情况，导致Follower没有接收到
-2. Raft的日志保证了Leader拥有已经commit的全部日志
-3. Candidate只需要拥有的日志和至少和其他节点一样新即可
+## Lab 2B
 
-#### 需要先保证Leader不会改动已经commit的部分
-1. Follower发送所有commit日志之后的下一位，和该日志对应的Term
-2. Leader中一定存在这个Term，它会将nextIndex设置为这个Leader中该Term对应的所有日志之后的下一条日志
-3. Leader下一次向Follower发送日志时，PrevLogIndex和PrevLogTerm会分别为Follower返回的XIndex - 1?和对应的日志条目的Term
-4. 上一步相当于使得PrevLogIndex >= commitIndex，即，如果Leader中的相同term的日志更多，PrevLogIndex会增加
-5. 按照以上规则，PrevLogIndex继续减少，直到找到一个Term和Follower中的相同，或者到达CommitIndex
+### Implementation
 
-#### 在Follower Log长度不足的前提下，先将nextIndex设置为Follower Log的长度在这个基础上，每次跳过一个任期，
-1. Leader发送prevLogIndex和prevLogTerm,
-2. 如果日志任期冲突，Follower返回任期和该任期对应的第一个日志的Log Index
-3. Leader中也有这个任期，将nextIndex设置为该任期对应所有日志之后的下一条日志
-		这个情况通常出现在新Leader被选出后，新Leader尝试复制日志给Follower，此时新Leader没有旧Leader的部分日志
-		通常来说是由于旧Leader已经发送了一部分给Follower，导致二者不一致
-		或者是旧Leader自己产生了一些日志，还没把日志复制给其他Follower，被新Leader取代了转化为Follower，这时候，新Leader应该把它拥有的对应任期的日志全部发送给Follower，它没有的则需要取代，因此将nextIndex设置为Leader的日志中，该任期对应所有日志条目之后的下一条
-		下一次新Leader再发送日志时，就会把这之后的日志全部取代了
-4. Leader中没有这个任期，已知prevLogIndex位置的日志不匹配，将nextIndex设置成XIndex
-	(由于Follower返回的XIndex对应任期的第一条日志的Log Index，跳过Follower的一整个任期，下一次PrevLogIndex就会指向前一个任期的日志)
-	通常出现在网络分区的情况下，网络分区恢复后，隔离区内的Follower会收到隔离区内旧Leader的日志信息，这些日志信息在新Leader中不存在
+1. Your first goal should be to pass `TestBasicAgree2B()`. Start by implementing `Start()`.
+
+2. Then write the code to send and receive new log entries via `AppendEntries` RPCs, following Figure 2.
+
+3. You will need to implement the election restriction (section 5.4.1 in the paper).
+
+4. One way to fail to reach agreement in the early Lab 2B tests is to hold repeated elections even though the leader is alive. Look for bugs in election timer management or not sending out heartbeats immediately after winning an election.
+
+5. Your code may have loops that repeatedly check for certain events. Don't have these loops execute continuously without pausing, as that will slow your implementation enough that it fails tests. Use Go's condition variables, or insert a `time.Sleep(10 * time.Millisecond)` in each loop iteration. [cond](https://golang.org/pkg/sync/#Cond)
+
+6. If you fail a test, look over the code for the test in `config.go` and `test_test.go` to get a better understanding of what the test is testing. `config.go` also illustrates how the tester uses the Raft API.
+
+### Fast Backup
+
+#### Summary
+
+1. Raft's log replication is not completely reliable. When the leader sends log entries during its term, failures or partial failures may occur, causing the follower not to receive them.
+
+2. Raft's logs ensure that the leader possesses all committed logs.
+
+3. A candidate only needs to have logs that are at least as up-to-date as those of other nodes.
+
+#### Ensuring the Leader Does Not Modify Already Committed Parts
+
+1. The follower sends the next index after all committed logs and the term corresponding to that log.
+
+2. This term must exist in the leader; it will set `nextIndex` to the next log entry after all logs of that term in the leader.
+
+3. When the leader sends logs to the follower next time, `PrevLogIndex` and `PrevLogTerm` will be set to `XIndex - 1` and the term of the corresponding log entry, respectively.
+
+4. The above step effectively ensures that `PrevLogIndex >= commitIndex`; that is, if the leader has more logs with the same term, `PrevLogIndex` will increase.
+
+5. According to the above rules, `PrevLogIndex` continues to decrease until it finds a term that matches the follower's, or reaches the `commitIndex`.
+
+#### When the Follower's Log Length Is Insufficient, First Set `nextIndex` to the Follower's Log Length, Then Skip One Term at a Time
+
+1. The leader sends `prevLogIndex` and `prevLogTerm`.
+
+2. If there is a log term conflict, the follower returns the term and the log index of the first log of that term.
+
+3. If the leader also has this term, set `nextIndex` to the next log entry after all logs of that term in the leader.
+
+   - This situation usually occurs when a new leader is elected, and the new leader tries to replicate logs to a follower. At this time, the new leader does not have some logs from the old leader.
+   - Generally, this is because the old leader has sent some logs to the follower, causing inconsistency between the two.
+   - Or the old leader generated some logs but hadn't replicated them to other followers before being replaced by the new leader and becoming a follower. In this case, the new leader should send all the logs it has for the corresponding term to the follower. For logs it doesn't have, they need to be overwritten. Therefore, `nextIndex` is set to the next log entry after all log entries of that term in the leader's log.
+   - The next time the new leader sends logs, it will overwrite all logs after that.
+
+4. If the leader does not have this term and knows that the log at `prevLogIndex` does not match, set `nextIndex` to `XIndex`.
+
+   - Since `XIndex` returned by the follower corresponds to the log index of the first log of the conflicting term, this skips an entire term in the follower. Next time, `PrevLogIndex` will point to the log of the previous term.
+   - This usually occurs in network partition situations. After the network partition recovers, followers in the isolated partition will receive log information from the old leader in the isolated partition, which does not exist in the new leader.
 
 ## Lab 2C
+
 ### Implementation
-1. A real implementation would write Raft's persistent state to disk each time it changed, and would read the state from disk when restarting after a reboot. Your implementation won't use the disk; instead, it will save and restore persistent state from a Persister object (see persister.go). 
 
-2. Whoever calls Raft.Make() supplies a Persister that initially holds Raft's most recently persisted state (if any). 
+1. A real implementation would write Raft's persistent state to disk each time it changed and would read the state from disk when restarting after a reboot. Your implementation won't use the disk; instead, it will save and restore persistent state from a `Persister` object (see `persister.go`).
 
-3. Raft should initialize its state from that Persister, and should use it to save its persistent state each time the state changes. **Use** the Persister's **ReadRaftState()** and **SaveRaftState()** methods.
-   
-4. Task: **Complete** the functions **persist()** and **readPersist()** in raft.go by adding code to save and restore persistent state. Y**ou will need to encode (or "serialize") the state as an array of bytes in order to pass it to the Persister.** Use the labgob encoder; **see the comments** in persist() and readPersist(). **labgob** is like Go's gob encoder but prints error messages if you try to encode structures with lower-case field names.
-   
-5. Task: **Insert calls to persist() at the points where your implementation changes persistent state**. Once you've done this, you should pass the remaining tests.
-	1. currentTerm
-	2. votedFor
-	3. log[]
+2. Whoever calls `Raft.Make()` supplies a `Persister` that initially holds Raft's most recently persisted state (if any).
+
+3. Raft should initialize its state from that `Persister`, and should use it to save its persistent state each time the state changes. **Use** the `Persister`'s `ReadRaftState()` and `SaveRaftState()` methods.
+
+4. **Task**: Complete the functions `persist()` and `readPersist()` in `raft.go` by adding code to save and restore persistent state. **You will need to encode (or "serialize") the state as an array of bytes in order to pass it to the `Persister`.** Use the `labgob` encoder; **see the comments** in `persist()` and `readPersist()`. `labgob` is like Go's `gob` encoder but prints error messages if you try to encode structures with lower-case field names.
+
+5. **Task**: Insert calls to `persist()` at the points where your implementation changes persistent state. Once you've done this, you should pass the remaining tests.
+
+   - `currentTerm`
+   - `votedFor`
+   - `log[]`
 
 ### Tips
-1. LeaderAppendEntries() && CandidateRequestVote()
-   注意在每个rpc前后都需要检查当前的rf.state, rf.currentTerm, rf.killed(), 避免发送过时的rpc，rpc后的检查需要放在Term检查之后
-2. Lab2C的test中，存在丢失vote的情况，尤其是在网络分区成N+1，N两个部分时，难以选出Leader，因此我这里采用了重传机制，同时设置发送间隔时间0.2s，在一个超时间隔内可以发送5-6次，避免选不出Leader的情况。重传机制仅限于当前任期，随着任期结束，协程自然终止。
-   （超时时间设置为1-1.5s，TimeOutChecker的时间间隔为0.03s，ApplyChecker的时间间隔为0.02s），为了提高性能，需要在始终运行的循环中添加time.Sleep(10 * time.Millisecond)
-   由于Leader发送心跳的间隔为0.05s，对于LeaderAppendEntries就没必要设置重传机制了。
-3. Candidate接收到同任期Leader的AppendEntries，需要转换为follower
-4. AppendEntries.PrevLogIndex < rf.commitIndex，Leader不能修改Follower中已经提交的日志，因为需要设置reply.Success和reply.LogInconsistency
-5. 在ApplyChecker中尽可能多的Apply当前已经Commit的所有LogEntry，写入applyCh时需要释放锁。
-6. 并行测试数量过多时会触发signal: killed 或者exit status 1异常并退出
+
+1. **LeaderAppendEntries()** & **CandidateRequestVote()**
+
+   - Note that before and after each RPC, you need to check the current `rf.state`, `rf.currentTerm`, and `rf.killed()` to avoid sending outdated RPCs. The checks after the RPC need to be placed after term checks.
+
+2. In the Lab 2C tests, there are situations where votes are lost, especially when the network is partitioned into `N+1` and `N` parts, making it difficult to elect a leader. Therefore, I adopted a retransmission mechanism and set the sending interval to 0.2s, so that within a timeout interval, 5-6 attempts can be made to avoid failing to elect a leader. The retransmission mechanism is limited to the current term; as the term ends, the goroutine naturally terminates.
+
+   - (The timeout is set to 1-1.5s, `TimeOutChecker` interval is 0.03s, `ApplyChecker` interval is 0.02s). To improve performance, you need to add `time.Sleep(10 * time.Millisecond)` in loops that run continuously.
+   - Since the leader sends heartbeats at intervals of 0.05s, there's no need to set a retransmission mechanism for `LeaderAppendEntries()`.
+
+3. When a candidate receives an `AppendEntries` from a leader with the same term, it needs to convert to a follower.
+
+4. If `AppendEntries.PrevLogIndex < rf.commitIndex`, the leader cannot modify logs that have already been committed in the follower. Therefore, you need to set `reply.Success` and `reply.LogInconsistency` appropriately.
+
+5. In `ApplyChecker`, apply as many `LogEntry` entries as possible that are currently committed. When writing to `applyCh`, you need to release the lock.
+
+6. When too many tests are run in parallel, it may trigger `signal: killed` or `exit status 1` exceptions and exit.
 
 ## Lab2D
 ou'll modify Raft to cooperate to save space: from time to time a service will persistently store a "snapshot" of its current state, and Raft will discard log entries that precede the snapshot. When a service falls far behind the leader and must catch up, the service first installs a snapshot and then replays log entries from after the point at which the snapshot was created.
@@ -229,70 +387,106 @@ CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int, snapshot []byte
 		3. This is in contrast to AppendEntries, which sends log entries that are then applied one by one by the service. 
 
 ### Ideas and Implementation
-实验版：AppendEntries的功能是发送心跳和发送follower需要的日志，最主要的是确认follower需要哪部分日志，通过AppendEntries RPC交互几轮以后，确定一个match的点，Leader把这之后的日志都复制给Follower。引入了快照机制以后，Leader给Follower发送AE RPC时，Leader乐观的从它的最后一项日志开始搜索，假设他们的快照信息一致或者Log有交集，那么Leader很快能定位到match point，并发送剩下的日志。
-引入了快照机制以后，Leader中一定有已经commit的全部日志，在prevIndex < Leader.lastIncludedIndex的情况下，Leader没有对应的日志项，无法向follower发送，只能先发送snapShot到follower。
-因此，在每次Leader发送AppendEntries时，如果检测到当前的leader.prevIndex[follower] < leader.lastIncludedIndex, 就不再发送AppendEntries，而是向其发送InstallSnapShot，这里的InstallSnapShot需要重置选举计时器。
-感觉这个设计是有缺陷的，InstallSnapShot RPC往往很大，在网络条件较差时容易传输失败，或许可以同时发送一个不含Entry的AppendEntries。
-Follower接收到SnapShot后，先判断任期，再重置选举计时器，与当前的snapshot对比并保存，随后修剪日志，需要找到一个LogEntry满足LogEntry.Term == Leader.LastIncludedTerm && args.LastIncludedIndex，替换并删除包括这个日志之前的所有日志（注意保留Index = 0处的日志项），在应用日志后需要更新follower的commitIndex和lastApplied，随后保存快照和状态，并通过applyCh发送applyMsg告知Server开始应用快照，注意不能持有锁。
 
-Leader根据reply需要更新nextIndex，采用XTerm和XIndex作为AppendEntries的返回值
+**Experimental Version**: The function of `AppendEntries` is to send heartbeats and the logs that the follower needs. The main point is to confirm which part of the logs the follower requires. After several rounds of `AppendEntries` RPC interactions, a matching point is determined, and the Leader copies all the logs after this point to the Follower. After introducing the snapshot mechanism, when the Leader sends `AppendEntries` RPC to the Follower, the Leader optimistically starts searching from its last log entry, assuming that their snapshot information is consistent or the logs overlap. Then the Leader can quickly locate the match point and send the remaining logs.
 
-InstallSnapShot的实现
-1. 判断任期，任期大于自己就转为Follower并重置选票
-2. 根据RPC和自身的LastIncludeIndex判断Snapshot是否Uptodate，如果不接受，直接返回
-3. 保存Snapshot
-4. 根据Snapshot的lastIncludedIndex寻找对应的日志项，检查对应日志项的任期是否匹配，并裁剪日志
-5. 更新自身的LastIncludedIndex, LastIncludedTerm, (以及FirstIndex，它的值一直等于LastIncludedIndex，应该省略掉这个额外的变量)
-6. 保存service的State和Snapshot
-7. 通过rf.applyCh向上层服务发送Snapshot
+After introducing the snapshot mechanism, the Leader must have all committed logs. In the case where `prevIndex < Leader.lastIncludedIndex`, the Leader does not have the corresponding log entry and cannot send it to the follower; it can only send a snapshot to the follower first.
 
-Leader发送InstallSnapShot的实现
-1. AppendEntries和InstallSnapShot本质上都是Leader向Follower同步信息，因此我设计成仅发送其中一种。
-   引入快照机制以后，由于日志被裁剪，为了Leader和Follower能够通过AppendEntries RPC继续匹配日志项，需要保存快照最后一项的index和term，即lastIncludedIndex和lastIncludedTerm，作为follower中第一个日志项之前的prevLogIndex和prevLogIndex，参与到过程中。
-2. 在发送AppendEntries RPC之前，Leader首先检查自己的日志，判断是否存在应发往Follower的日志项，如果存在就发送AppendEntries RPC，否则发送InstallSnapshotRPC，index大于rf.LastIncludedIndex的日志项都存在。 在没有快照机制的情况下，发往follower的AppendEntries RPC中prevLogIndex、prevLogTerm应该根据下标为rf.nextIndex[followerID] -1的日志，即nextIndex[server]下标所在日志项的前一项得出。因此，假如Leader准备RPC的参数时发现，args.prevLogIndex <  rf.lastIncludedIndex，说明nextLogIndex[server] <= rf.lastIncludedIndex, 想要发送的nextLogEntry包含在快照中，follower的进度太慢了只能发送InstallSnapshot。否则，说明nextIndex[server]的日志项存在于Leader的日志中，发送AppendEntries。
-3. Raft peer的日志都是1-based index，index = 0处的日志项无意义，在不裁剪日志的情况下，日志数组rf.Log的下标arrayIndex和实际的下标index相同。 引入快照机制以后，当arrayIndex > 0 时，日志项rf.Log[arrayIndex]对应的下标index = rf.lastIncludedIndex + arrayIndex，但当我们需要获取arrayindex = 0处日志项的信息时，应该返回rf.lastLogIndex和rf.lastLogTerm。
-   例如，（Leader发送AppendEntries RPC给Follower，需要设置args.prevLogIndex = rf.nextIndex[server] - 1，但此时Leader.nextIndex[followerID] = Follower.Log[1]），Follower接收到AppendEntries RPC后，寻找args.PrevLogIndex对应的日志项Entry，比较args.PrevLogTerm和Entry.Term。因此Follower会根据arrayIndex = args.prevLogIndex - rf.lastIncludedIndex得到arrayIndex = 0，找到rf.Log[0] ，但rf.Log[0]是无意义的，此时应该返回rf.Log[1]日志项前一项的数据，即rf.prevLogIndex和rf.prevLogTerm来匹配。
-   实现：在Lab2B中，最好就不要使用rf.Log[index]来获取下标为index的日志，转而实现一个rf.getLogAt(arrayIndex)的方法，先获取对应日志项在日志列表rf.Log[]中的数组下标arrayIndex，根据arrayIndex = TargetIndex - rf.lastIncludedIndex计算，再用ra.getLogAt(arrayIndex)获取信息，当arrayIndex = 0时，返回rf.lastIncludedIndex, rf.lastIncludedTerm
-4. InstallSnapshot和fast back-up的兼容 
-   未引入快照机制时，使用课上介绍的方法，向AppendEntriesReply中添加XTerm, XIndex, XLen信息
-   当接收到来自Follower的AppendEntriesArgs时，包含args.PrevLogIndex, args.PrevLogTerm
-   1. Follower:
-	   1. args.PrevLogIndex对应下标的日志项LogEntry存在
-		   1. LogEntry.Term == args.PrevLogTerm，匹配
-		   2. LogEntry.Term != args.PrevLogTerm, 任期不匹配， 找到rf.Log[]中第一个满足entry.Term == LogEntry.Term的日志项，并返回它的下标和任期, XTerm = entry.Term, XIndex = entry.Index, 
-		      即Follower悲观地认为对应任期的日志是不完整的，需要Leader从头同步
-	   2. args.PrevLogIndex对应下标的日志项LogEntry不存在
-		   1. 下一次尝试从日志最后一项开始，返回 XTerm = -1, XLen = len(Follower.Log)
-   2. Leader
-	   1. XTerm = -1，设置nextIndex[FollowerID] = XLen
-	   2. XTerm != -1，找到rf.Log[]中最后一个满足entry.Term == XTerm的日志项，设置nextIndex[FollowerID] = entry.Index + 1，即Leader乐观地认为对应任期的日志在Follower中都存在，只需要发送对应任期以后的日志
-	      
-	可以简化为，只使用XTerm和XIndex两个参数，返回XTerm=-1时，Leader接收Follower的reply并设置nextIndex为XIndex
-	1. Follower:
-	   1. args.PrevLogIndex对应下标的日志项LogEntry存在
-		   1. LogEntry.Term == args.PrevLogTerm，匹配
-		   2. LogEntry.Term != args.PrevLogTerm, 任期不匹配， 找到rf.Log[]中第一个满足entry.Term == LogEntry.Term的日志项，并返回它的下标和任期, XTerm = entry.Term, XIndex = entry.Index, 
-		      即Follower悲观地认为对应任期的日志是不完整的，需要Leader从头同步
-	   2. args.PrevLogIndex对应下标的日志项LogEntry不存在
-		   1. 下一次尝试从日志最后一项开始，返回 XTerm = -1, XIndex = len(Follower.Log)
-	2. Leader
-	   1. XTerm = -1，设置nextIndex[FollowerID] = XIndex
-	   2. XTerm != -1，找到rf.Log[]中最后一个满足entry.Term == XTerm的日志项，设置nextIndex[FollowerID] = entry.Index + 1，即Leader乐观地认为对应任期的日志在Follower中都存在，只需要发送对应任期以后的日志
-	
-	引入快照机制后，会产生以下几种情况
-	1. Follower过于落后，args.prevLogIndex 大于Follower中最后一项日志的下标，此时肯定无法匹配，从最后一个日志项的下一项开始。
-	2. Follower接收到的RPC来自于合法的Leader，但它是过时的，试图和Follower中已经包含在快照中的日志项匹配，测试中没有发现这个情况。
-	   
-	实现
-	1. Follower:
-	   1. 判断Leader匹配的日志项是否大于Follower的最后一个日志项args.PrevLogIndex > lastLogIndex，如果大于，返回XTerm= -1, XIndex = rf.lastLogIndex()+1，否则继续
-	   2. args.PrevLogIndex对应下标的日志项LogEntry是否存在
-		   1. LogEntry.Term == args.PrevLogTerm，匹配
-		   2. LogEntry.Term != args.PrevLogTerm, 任期不匹配， 找到rf.Log[]中第一个满足entry.Term == LogEntry.Term的日志项，并返回它的下标和任期, XTerm = entry.Term, XIndex = entry.Index, 
-		      即Follower悲观地认为对应任期的日志是不完整的，需要Leader从头同步
-	   2. args.PrevLogIndex对应下标的日志项LogEntry不存在
-		   1. 下一次尝试从日志最后一项开始，返回 XTerm = -1, XIndex = rf.lastLogIndex() + 1
-  
-	2. Leader
-	   1. XTerm = -1，设置nextIndex[FollowerID] = XIndex
-	   2. XTerm != -1，找到rf.Log[]中最后一个满足entry.Term == XTerm的日志项，设置nextIndex[FollowerID] = entry.Index + 1，即Leader乐观地认为对应任期的日志在Follower中都存在，只需要发送对应任期以后的日志
+Therefore, every time the Leader sends `AppendEntries`, if it detects that the current `leader.prevIndex[follower] < leader.lastIncludedIndex`, it no longer sends `AppendEntries` but sends `InstallSnapshot` instead. The `InstallSnapshot` here needs to reset the election timer.
+
+I feel that this design has flaws. The `InstallSnapshot` RPC is often large and can easily fail to transmit under poor network conditions. Perhaps an `AppendEntries` without entries can be sent at the same time.
+
+When the Follower receives the Snapshot, it first checks the term, resets the election timer, compares and saves the current snapshot, and then trims the log. It needs to find a `LogEntry` that satisfies `LogEntry.Term == Leader.LastIncludedTerm && args.LastIncludedIndex`, replaces and deletes all logs before this log (note to keep the log entry at `Index = 0`). After applying the log, the follower needs to update its `commitIndex` and `lastApplied`, then save the snapshot and state, and send an `applyMsg` through `applyCh` to inform the Server to start applying the snapshot, ensuring that no locks are held.
+
+The Leader needs to update `nextIndex` based on the reply, using `XTerm` and `XIndex` as the return values of `AppendEntries`.
+
+**Implementation of InstallSnapshot**
+
+1. **Check the term**: If the term is greater than its own, convert to Follower and reset votes.
+2. **Determine if the Snapshot is up to date** based on the RPC and its own `LastIncludedIndex`. If not accepted, return directly.
+3. **Save the Snapshot**.
+4. **Find the corresponding log entry** according to the Snapshot's `lastIncludedIndex`, check whether the term of the corresponding log entry matches, and trim the log.
+5. **Update** its own `LastIncludedIndex`, `LastIncludedTerm` (and `FirstIndex`, whose value is always equal to `LastIncludedIndex`; this extra variable should be omitted).
+6. **Save the service's State and Snapshot**.
+7. **Send the Snapshot** to the upper-layer service through `rf.applyCh`.
+
+**Implementation of Leader Sending InstallSnapshot**
+
+1. **Only send one of AppendEntries or InstallSnapshot**: Since `AppendEntries` and `InstallSnapshot` are essentially the Leader synchronizing information to the Follower, I designed it to send only one of them.
+
+   After introducing the snapshot mechanism, because the logs are trimmed, to allow the Leader and Follower to continue matching log entries through `AppendEntries` RPC, the index and term of the last entry in the snapshot need to be saved, i.e., `lastIncludedIndex` and `lastIncludedTerm`, as the `prevLogIndex` and `prevLogTerm` before the first log entry in the follower, participating in the process.
+
+2. **Before sending AppendEntries RPC**, the Leader first checks its own log to determine whether there are log entries to be sent to the Follower. If so, it sends `AppendEntries` RPC; otherwise, it sends `InstallSnapshot` RPC. Log entries with `index` greater than `rf.LastIncludedIndex` all exist.
+
+   In the case without the snapshot mechanism, the `prevLogIndex` and `prevLogTerm` in the `AppendEntries` RPC sent to the follower should be derived from the log at index `rf.nextIndex[followerID] - 1`, that is, the previous log entry of the log at `nextIndex[server]`. Therefore, if the Leader finds when preparing the RPC parameters that `args.prevLogIndex < rf.lastIncludedIndex`, it means that `nextIndex[server] <= rf.lastIncludedIndex`, and the `nextLogEntry` to be sent is included in the snapshot; the follower is too far behind and can only receive `InstallSnapshot`. Otherwise, it means that the log entry at `nextIndex[server]` exists in the Leader's log, and `AppendEntries` is sent.
+
+3. **Indexing in Logs with Snapshots**: Raft peers' logs use 1-based indexing; the log entry at `index = 0` is meaningless. Without log trimming, the array index of the log array `rf.Log` and the actual index are the same. After introducing the snapshot mechanism, when `arrayIndex > 0`, the index corresponding to the log entry `rf.Log[arrayIndex]` is `index = rf.lastIncludedIndex + arrayIndex`. But when we need to get the information of the log entry at `arrayIndex = 0`, we should return `rf.lastIncludedIndex` and `rf.lastIncludedTerm`.
+
+   For example, when the Leader sends `AppendEntries` RPC to the Follower, it needs to set `args.prevLogIndex = rf.nextIndex[server] - 1`, but at this time `Leader.nextIndex[followerID] = Follower.Log[1]`. After the Follower receives the `AppendEntries` RPC, it looks for the `LogEntry` corresponding to `args.PrevLogIndex` and compares `args.PrevLogTerm` with `Entry.Term`. Therefore, the Follower will calculate `arrayIndex = args.prevLogIndex - rf.lastIncludedIndex = 0` and find `rf.Log[0]`. But `rf.Log[0]` is meaningless. At this time, it should return the data of the previous entry of `rf.Log[1]`, i.e., `rf.prevLogIndex` and `rf.prevLogTerm`, to match.
+
+   **Implementation**: In Lab 2B, it's best not to use `rf.Log[index]` to get the log at a specific index. Instead, implement a method `rf.getLogAt(arrayIndex)`, first calculating the array index `arrayIndex` of the corresponding log entry in the log list `rf.Log[]` by `arrayIndex = TargetIndex - rf.lastIncludedIndex`, then use `rf.getLogAt(arrayIndex)` to get information. When `arrayIndex = 0`, return `rf.lastIncludedIndex` and `rf.lastIncludedTerm`.
+
+4. **Compatibility of InstallSnapshot and Fast Backup**
+
+   Before introducing the snapshot mechanism, the method introduced in the course is used to add `XTerm`, `XIndex`, `XLen` information to `AppendEntriesReply`.
+
+   When receiving `AppendEntriesArgs` from the Follower, it contains `args.PrevLogIndex`, `args.PrevLogTerm`.
+
+   1. **Follower**:
+
+      1. **LogEntry at `args.PrevLogIndex` exists**:
+
+         1. If `LogEntry.Term == args.PrevLogTerm`, it's a match.
+         2. If `LogEntry.Term != args.PrevLogTerm`, the term does not match. Find the first log entry in `rf.Log[]` that satisfies `entry.Term == LogEntry.Term`, and return its index and term (`XTerm = entry.Term`, `XIndex = entry.Index`). This means the Follower pessimistically believes that the logs of the corresponding term are incomplete and needs the Leader to synchronize from the beginning.
+
+      2. **LogEntry at `args.PrevLogIndex` does not exist**:
+
+         1. Next time, try from the last log entry, return `XTerm = -1`, `XLen = len(Follower.Log)`
+
+   2. **Leader**:
+
+      1. If `XTerm = -1`, set `nextIndex[FollowerID] = XLen`.
+      2. If `XTerm != -1`, find the last log entry in `rf.Log[]` that satisfies `entry.Term == XTerm`, set `nextIndex[FollowerID] = entry.Index + 1`. This means the Leader optimistically believes that the logs of the corresponding term exist in the Follower and only needs to send the logs after that term.
+
+   It can be simplified to use only `XTerm` and `XIndex` as parameters. When `XTerm = -1` is returned, the Leader receives the Follower's reply and sets `nextIndex` to `XIndex`.
+
+   1. **Follower**:
+
+      1. **LogEntry at `args.PrevLogIndex` exists**:
+
+         1. If `LogEntry.Term == args.PrevLogTerm`, it's a match.
+         2. If `LogEntry.Term != args.PrevLogTerm`, the term does not match. Find the first log entry in `rf.Log[]` that satisfies `entry.Term == LogEntry.Term`, and return its index and term (`XTerm = entry.Term`, `XIndex = entry.Index`). This means the Follower pessimistically believes that the logs of the corresponding term are incomplete and needs the Leader to synchronize from the beginning.
+
+      2. **LogEntry at `args.PrevLogIndex` does not exist**:
+
+         1. Next time, try from the last log entry, return `XTerm = -1`, `XIndex = len(Follower.Log)`
+
+   2. **Leader**:
+
+      1. If `XTerm = -1`, set `nextIndex[FollowerID] = XIndex`.
+      2. If `XTerm != -1`, find the last log entry in `rf.Log[]` that satisfies `entry.Term == XTerm`, set `nextIndex[FollowerID] = entry.Index + 1`. This means the Leader optimistically believes that the logs of the corresponding term exist in the Follower and only needs to send the logs after that term.
+
+   **After introducing the snapshot mechanism**, the following situations may occur:
+
+   1. **Follower is too far behind**: `args.prevLogIndex` is greater than the index of the Follower's last log entry. In this case, it cannot match, and starts from the next entry after the last log entry.
+
+   2. **Follower receives outdated RPCs** from a legitimate Leader, trying to match log entries that are already included in the snapshot in the Follower. This situation was not observed in tests.
+
+   **Implementation**
+
+   1. **Follower**:
+
+      1. **Determine if the Leader's matching log entry is beyond the Follower's last log entry**: If `args.PrevLogIndex > lastLogIndex`, return `XTerm = -1`, `XIndex = rf.lastLogIndex() + 1`; otherwise, continue.
+      2. **Check if the LogEntry at `args.PrevLogIndex` exists**:
+
+         1. If `LogEntry.Term == args.PrevLogTerm`, it's a match.
+         2. If `LogEntry.Term != args.PrevLogTerm`, the term does not match. Find the first log entry in `rf.Log[]` that satisfies `entry.Term == LogEntry.Term`, and return its index and term (`XTerm = entry.Term`, `XIndex = entry.Index`). This means the Follower pessimistically believes that the logs of the corresponding term are incomplete and needs the Leader to synchronize from the beginning.
+
+      3. **LogEntry at `args.PrevLogIndex` does not exist**:
+
+         1. Next time, try from the last log entry, return `XTerm = -1`, `XIndex = rf.lastLogIndex() + 1`
+
+   2. **Leader**:
+
+      1. If `XTerm = -1`, set `nextIndex[FollowerID] = XIndex`.
+      2. If `XTerm != -1`, find the last log entry in `rf.Log[]` that satisfies `entry.Term == XTerm`, set `nextIndex[FollowerID] = entry.Index + 1`. This means the Leader optimistically believes that the logs of the corresponding term exist in the Follower and only needs to send the logs after that term.
