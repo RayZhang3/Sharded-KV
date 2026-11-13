@@ -114,26 +114,14 @@ type ShardKV struct {
 	shardsState [shardctrler.NShards]int // Shard state (Persistent)
 }
 
-// Function: Avoid liveLock
-// Periodically check if the raft (isLeader && has LogEntry with its term)
-// If yes, send an empty LogEntry to the raft
+// RaftLogChecker gives a new leader a current-term entry so it can commit
+// earlier entries even when no client requests arrive.
 func (kv *ShardKV) RaftLogChecker() {
-	ch := make(chan bool)
-	defer close(ch)
-	go func() {
-		time.Sleep(time.Millisecond * 500)
-		ch <- true
-	}()
-	PrettyDebug(dPersist, "KVServer %d-%d RaftLogChecker Starts", kv.gid, kv.me)
-	for {
-		if <-ch {
-			needEmptyLog := kv.rf.NeedEmptyLogEntry()
-			if needEmptyLog {
-				PrettyDebug(dPersist, "KVServer %d-%d needEmptyLogEntry", kv.gid, kv.me)
-				commandMsg := CommandMsg{NoOperation, nil}
-				kv.rf.Start(commandMsg)
-			}
+	for !kv.killed() {
+		if kv.rf.NeedEmptyLogEntry() {
+			kv.rf.Start(CommandMsg{CommandType: NoOperation})
 		}
+		time.Sleep(300 * time.Millisecond)
 	}
 }
 
